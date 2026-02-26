@@ -1,0 +1,8 @@
+mlx-whisper
+mlx
+numpy
+torch
+torchaudio
+speechbrain
+python-docx
+huggingface_hub

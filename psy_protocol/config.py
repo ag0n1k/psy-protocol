@@ -1,0 +1,41 @@
+DEFAULT_WHISPER_MODEL = "~/.cache/mlx/large-v3-turbo"
+DEFAULT_DIARIZATION_MODEL = "mlx-community/pyannote-segmentation-3.0-mlx"
+
+DEFAULT_FONT_NAME = "Times New Roman"
+TABLE_FONT_NAME = "Calibri"
+DEFAULT_FONT_SIZE_PT = 12
+DEFAULT_LINE_SPACING = 1.0
+DEFAULT_SPACE_BEFORE_PT = 1
+DEFAULT_SPACE_AFTER_PT = 0
+
+DEFAULT_EMBEDDING_MIN_DURATION = 0.3
+DEFAULT_EMBEDDING_N_MFCC = 20
+DEFAULT_EMBEDDING_N_MELS = 40
+DEFAULT_KMEANS_ITERS = 20
+DEFAULT_SPEAKER_EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+DEFAULT_SPEAKER_EMBEDDING_DEVICE = "cpu"
+
+DEFAULT_WORD_SMOOTH_MIN_WORDS = 2
+DEFAULT_WORD_PROB_THRESHOLD = 0.2
+
+LOG_FORMAT = "%(levelname)s %(message)s"
+
+TABLE_HEADERS = [
+    "№",
+    "К или Т",
+    "Текст диалога",
+    "Феномены клиента",
+    "Комментарии к процессу клиента",
+    "Комментарии к интервенциям терапевта",
+    "Комментарии к внутренней личной динамике терапевта",
+]
+
+TABLE_COLUMN_WIDTHS_CM = [0.91, 1.24, 9.02, 3.06, 3.48, 3.57, 3.31]
+
+A4_LANDSCAPE_WIDTH_CM = 29.7
+A4_LANDSCAPE_HEIGHT_CM = 21.0
+
+MARGIN_TOP_CM = 1.5
+MARGIN_BOTTOM_CM = 3.0
+MARGIN_LEFT_CM = 2.0
+MARGIN_RIGHT_CM = 2.0
