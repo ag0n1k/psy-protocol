@@ -2,7 +2,9 @@ mlx-whisper
 mlx
 numpy
 torch
+torchcodec
 torchaudio
 speechbrain
 python-docx
 huggingface_hub
+aiogram
