@@ -95,7 +95,7 @@ VictoriaMetrics UI/API will be available at:
 
 Scrape target is configured as:
 
-- `telegram-bot-api:8082` via `monitoring/prometheus.yml`
+- `telegram-bot-api:8082` via `infra/monitoring/prometheus.yml`
 
 ### Run Grafana with VictoriaMetrics datasource
 
@@ -114,12 +114,12 @@ Default credentials (from `.env`):
 
 Datasource `VictoriaMetrics` is provisioned automatically from:
 
-- `monitoring/grafana/provisioning/datasources/victoriametrics.yml`
+- `infra/monitoring/grafana/provisioning/datasources/victoriametrics.yml`
 
 Dashboard provisioning is enabled from:
 
-- `monitoring/grafana/provisioning/dashboards/default.yml`
-- `monitoring/grafana/dashboards/telegram-bot-api-overview.json`
+- `infra/monitoring/grafana/provisioning/dashboards/default.yml`
+- `infra/monitoring/grafana/dashboards/telegram-bot-api-overview.json`
 
 ### Run bot
 
