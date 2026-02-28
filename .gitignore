@@ -1,0 +1,19 @@
+# Local environment and IDE
+.env
+.idea/
+
+# Python cache
+__pycache__/
+psy_protocol/__pycache__/
+
+# Local temp artifacts
+.tmp_pkg/
+
+# Runtime data directories
+telegram-bot-api-data/
+victoria-metrics-data/
+grafana-data/
+transcripts/
+
+# Infra build artifacts
+infra/*.tar.gz

@@ -28,30 +28,33 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 TARGET="${1:-}"
-REMOTE_DIR="${2:-~/psy-protocol-infra}"
 
 if [[ -z "${TARGET}" ]]; then
   usage
   exit 1
 fi
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_SCRIPT="${ROOT_DIR}/infra/build_bundle.sh"
+REMOTE_DIR="psy-protocol"
+echo "Deploying stack on ${TARGET}/${REMOTE_DIR}"
 
-BUNDLE_PATH="$("${BUILD_SCRIPT}")"
-BUNDLE_FILE="$(basename "${BUNDLE_PATH}")"
-REMOTE_TMP="/tmp/${BUNDLE_FILE}"
+ssh $TARGET "mkdir -p ~/${REMOTE_DIR}/mounts/grafana-data"
+ssh $TARGET "mkdir -p ~/${REMOTE_DIR}/mounts/telegram-bot-api-data"
+ssh $TARGET "mkdir -p ~/${REMOTE_DIR}/mounts/victoria-metrics-data"
 
-echo "Uploading ${BUNDLE_FILE} to ${TARGET}:${REMOTE_TMP}"
-scp "${BUNDLE_PATH}" "${TARGET}:${REMOTE_TMP}"
+ssh $TARGET "mkdir -p ~/${REMOTE_DIR}/infra/monitoring/grafana/provisioning/datasources/"
+ssh $TARGET "mkdir -p ~/${REMOTE_DIR}/infra/monitoring/grafana/provisioning/dashboards/"
+ssh $TARGET "mkdir -p ~/${REMOTE_DIR}/infra/monitoring/grafana/dashboards/"
 
-echo "Deploying stack on ${TARGET}"
+scp -O infra/monitoring/prometheus.yml "${TARGET}:${REMOTE_DIR}/infra/monitoring/prometheus.yml"
+scp -O infra/.env.server.example "${TARGET}:${REMOTE_DIR}/.env.example"
+scp -O infra/monitoring/grafana/provisioning/datasources/victoriametrics.yml "${TARGET}:${REMOTE_DIR}/infra/monitoring/grafana/provisioning/datasources/victoriametrics.yml"
+scp -O infra/monitoring/grafana/provisioning/dashboards/default.yml "${TARGET}:${REMOTE_DIR}/infra/monitoring/grafana/provisioning/dashboards/default.yml"
+scp -O infra/monitoring/grafana/dashboards/telegram-bot-api-overview.json "${TARGET}:${REMOTE_DIR}/infra/monitoring/grafana/dashboards/telegram-bot-api-overview.json"
+scp -O infra/nginx/default.conf "${TARGET}:${REMOTE_DIR}/infra/nginx/default.conf"
+
+
 ssh "${TARGET}" "REMOTE_DIR='${REMOTE_DIR}' REMOTE_TMP='${REMOTE_TMP}' bash -s" <<'EOF'
 set -euo pipefail
-
-mkdir -p "${REMOTE_DIR}"
-tar -xzf "${REMOTE_TMP}" -C "${REMOTE_DIR}"
-rm -f "${REMOTE_TMP}"
 
 cd "${REMOTE_DIR}"
 
@@ -68,7 +71,7 @@ if [[ -z "$(awk -F= '/^TELEGRAM_API_ID=/{print $2}' .env)" || -z "$(awk -F= '/^T
 fi
 
 docker compose pull
-docker compose up -d telegram-bot-api victoria-metrics grafana
+docker compose up -d
 docker compose ps
 EOF
 
