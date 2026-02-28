@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import copy
 import logging
 import os
 import shutil
@@ -12,7 +13,13 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import SimpleFilesPathWrapper, TelegramAPIServer
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from psy_protocol.config import LOG_FORMAT
 from psy_protocol.pipeline import ProcessingOptions, process_audio_file
@@ -20,6 +27,85 @@ from psy_protocol.pipeline import ProcessingOptions, process_audio_file
 
 TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
+SESSION_TTL_SECONDS = 3600  # 1 hour
+WHISPER_LARGE_V3 = "~/.cache/mlx/large-v3"
+
+PRESETS: Dict[str, Dict[str, Any]] = {
+    "large_model": {
+        "label": "🎙 Точнее (large-v3)",
+        "whisper_model": WHISPER_LARGE_V3,
+        "force_whisper": True,
+    },
+    "noisy": {
+        "label": "🔇 Плохой звук",
+        "silence_threshold": 0.25,
+        "merge_gap": 0.5,
+        "sandwich_max_duration": 2.0,
+        "word_prob_threshold": 0.15,
+    },
+    "interrupts": {
+        "label": "🗣 Много перебиваний",
+        "merge_gap": 1.0,
+        "sandwich_max_duration": 3.0,
+        "word_prob_threshold": 0.1,
+        "word_smooth_min_words": 3,
+    },
+    "sentences": {
+        "label": "📝 По фразам",
+    },
+}
+
+CONSENT_TEXT = """📋 *Пользовательское соглашение*
+
+Перед использованием бота ознакомьтесь с условиями обработки данных\.
+
+*Что делает бот:*
+Принимает аудиозаписи, распознаёт речь и формирует текстовый протокол\. Вся обработка выполняется локально, без передачи аудио сторонним облачным сервисам\.
+
+*Ваши данные:*
+• Аудиофайл временно сохраняется для обработки и удаляется по истечении сессии \(1 час\)\.
+• Результаты \(TXT, DOCX\) хранятся в течение сессии и удаляются вместе с аудио\.
+• Данные не передаются и не продаются третьим лицам\.
+
+*Ответственность:*
+Автор бота принимает разумные технические меры для защиты данных, однако не несёт ответственности за ущерб вследствие обстоятельств вне его контроля \(взлом серверов, утечки на стороне инфраструктуры и т\.п\.\)\.
+
+*Ваши обязательства:*
+Отправляя аудио, вы подтверждаете, что имеете законное право на передачу данной записи и несёте ответственность за правомерность её использования\.
+
+Нажмите «✅ Принять», чтобы продолжить\."""
+
+
+@dataclass
+class JobSession:
+    work_dir: Path
+    audio_path: Path
+    base_options: Any  # ProcessingOptions — imported below
+    expires_at: float  # time.monotonic() + TTL
+
+
+# Keyed by chat_id (int)
+job_sessions: Dict[int, "JobSession"] = {}
+
+CONSENTS_FILE = Path("consents/accepted.txt")
+consented_users: set[int] = set()
+
+
+def load_consents() -> None:
+    """Load persisted chat_ids into consented_users set."""
+    if CONSENTS_FILE.exists():
+        for line in CONSENTS_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.isdigit() or (line.startswith("-") and line[1:].isdigit()):
+                consented_users.add(int(line))
+    logging.info("Consents loaded: %d users", len(consented_users))
+
+
+def save_consent(chat_id: int) -> None:
+    """Persist a new consent by appending chat_id to file."""
+    CONSENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with CONSENTS_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"{chat_id}\n")
 
 
 @dataclass
@@ -116,6 +202,51 @@ def build_processing_options(settings: TelegramSettings, output_docx: Path, cach
     if settings.max_speakers is not None:
         options.max_speakers = settings.max_speakers
     return options
+
+
+def apply_preset(base_opts: Any, preset_key: str) -> Any:
+    opts = copy.copy(base_opts)
+    overrides = {k: v for k, v in PRESETS[preset_key].items() if k != "label"}
+    for key, val in overrides.items():
+        setattr(opts, key, val)
+    return opts
+
+
+def build_consent_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Принять", callback_data="consent:accept"),
+        ]]
+    )
+
+
+def build_retry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=PRESETS["large_model"]["label"],
+                    callback_data="retry:large_model",
+                ),
+                InlineKeyboardButton(
+                    text=PRESETS["noisy"]["label"],
+                    callback_data="retry:noisy",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=PRESETS["interrupts"]["label"],
+                    callback_data="retry:interrupts",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=PRESETS["sentences"]["label"],
+                    callback_data="retry:sentences",
+                ),
+            ],
+        ]
+    )
 
 
 def ensure_temp_root() -> None:
@@ -245,7 +376,96 @@ async def progress_updater(status_message: Message, progress: Dict[str, Any], in
             logging.debug("Final status message edit skipped", exc_info=True)
 
 
+async def run_pipeline_and_send(
+    chat_id: int,
+    audio_path: Path,
+    opts: Any,
+    status_message: Message,
+    reply_target: Message,
+    progress: Dict[str, Any],
+) -> bool:
+    """Run the pipeline and send result files. Returns True on success."""
+    updater_task = asyncio.create_task(
+        progress_updater(status_message, progress, interval_seconds=5)
+    )
+    try:
+        docx_path, txt_path = await asyncio.to_thread(
+            process_audio_file, audio_path, opts, lambda s, p, m: _update_progress(progress, s, p, m, chat_id)
+        )
+        progress["done"] = True
+        progress["success"] = True
+        await updater_task
+        await reply_target.answer_document(FSInputFile(path=str(txt_path)))
+        await reply_target.answer_document(FSInputFile(path=str(docx_path)))
+        await reply_target.answer(
+            "Если результат неточный — попробуйте один из вариантов:"
+            "- Точнее -- использовать другую модель в 3-5 раз медленее"
+            "- Плохой звук -- изменить параметры ",
+            reply_markup=build_retry_keyboard(),
+        )
+        return True
+    except Exception:
+        progress["done"] = True
+        progress["success"] = False
+        logging.exception("Pipeline failed for chat_id=%s", chat_id)
+        try:
+            await updater_task
+        except Exception:
+            logging.debug("Updater task finished with error", exc_info=True)
+        return False
+    finally:
+        if not updater_task.done():
+            updater_task.cancel()
+
+
+def _update_progress(
+    progress: Dict[str, Any],
+    stage: str,
+    percent: Optional[float],
+    status_text: str,
+    chat_id: int,
+) -> None:
+    if progress.get("stage") != stage:
+        progress["stage_started_at"] = time.monotonic()
+    progress["stage"] = stage
+    progress["percent"] = percent
+    progress["message"] = status_text
+    if stage == "whisper" and percent is not None:
+        rounded = int(float(percent))
+        last_logged = int(progress.get("last_logged_whisper_percent", -1))
+        if rounded >= last_logged + 5:
+            logging.info(
+                "Telegram chat_id=%s whisper_progress=%d%%",
+                chat_id,
+                rounded,
+            )
+            progress["last_logged_whisper_percent"] = rounded
+
+
+def _make_progress() -> Dict[str, Any]:
+    now = time.monotonic()
+    return {
+        "done": False,
+        "success": False,
+        "stage": "start",
+        "percent": 0.0,
+        "message": "Queued",
+        "started_at": now,
+        "stage_started_at": now,
+        "last_logged_whisper_percent": -1,
+    }
+
+
 async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettings) -> None:
+    chat_id = message.chat.id if message.chat else 0
+    if chat_id not in consented_users:
+        await message.answer(
+            CONSENT_TEXT,
+            parse_mode="MarkdownV2",
+            reply_markup=build_consent_keyboard(),
+        )
+        return
+
     download_result = await download_audio(message, bot, settings)
     if not download_result:
         await message.answer(
@@ -258,61 +478,110 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
         "Спасибо! 😊 Аудио получено, начинаю обработку. "
         "Пожалуйста, немного подождите ⏳"
     )
-    started_at = time.monotonic()
-    progress: Dict[str, Any] = {
-        "done": False,
-        "success": False,
-        "stage": "start",
-        "percent": 0.0,
-        "message": "Queued",
-        "started_at": started_at,
-        "stage_started_at": started_at,
-        "last_logged_whisper_percent": -1,
-    }
+    chat_id = message.chat.id if message.chat else 0
+    options = build_processing_options(settings, output_docx=output_docx, cache_dir=work_dir / "cache")
+    progress = _make_progress()
 
-    def on_progress(stage: str, percent: Optional[float], status_text: str) -> None:
-        if progress.get("stage") != stage:
-            progress["stage_started_at"] = time.monotonic()
-        progress["stage"] = stage
-        progress["percent"] = percent
-        progress["message"] = status_text
-        if stage == "whisper" and percent is not None:
-            rounded = int(float(percent))
-            last_logged = int(progress.get("last_logged_whisper_percent", -1))
-            if rounded >= last_logged + 5:
-                logging.info(
-                    "Telegram chat_id=%s message_id=%s whisper_progress=%d%%",
-                    message.chat.id if message.chat else 0,
-                    message.message_id,
-                    rounded,
-                )
-                progress["last_logged_whisper_percent"] = rounded
+    success = await run_pipeline_and_send(
+        chat_id=chat_id,
+        audio_path=audio_path,
+        opts=options,
+        status_message=status_message,
+        reply_target=message,
+        progress=progress,
+    )
 
-    updater_task = asyncio.create_task(progress_updater(status_message, progress, interval_seconds=5))
-    try:
-        options = build_processing_options(settings, output_docx=output_docx, cache_dir=work_dir / "cache")
-        docx_path, txt_path = await asyncio.to_thread(process_audio_file, audio_path, options, on_progress)
-        progress["done"] = True
-        progress["success"] = True
-        await updater_task
-        await message.answer_document(FSInputFile(path=str(txt_path)))
-        await message.answer_document(FSInputFile(path=str(docx_path)))
-    except Exception:
-        progress["done"] = True
-        progress["success"] = False
-        try:
-            await updater_task
-        except Exception:
-            logging.debug("Updater task finished with error", exc_info=True)
-        logging.exception("Failed to process audio from Telegram")
+    if success:
+        job_sessions[chat_id] = JobSession(
+            work_dir=work_dir,
+            audio_path=audio_path,
+            base_options=options,
+            expires_at=time.monotonic() + SESSION_TTL_SECONDS,
+        )
+        logging.info("Session stored for chat_id=%s", chat_id)
+    else:
+        logging.error("Failed to process audio from Telegram for chat_id=%s", chat_id)
         await message.answer(
             "Извините, не получилось обработать это аудио 😔 "
             "Пожалуйста, попробуйте другой файл."
         )
-    finally:
-        if not updater_task.done():
-            updater_task.cancel()
         cleanup_work_dir(work_dir)
+
+
+async def handle_retry_callback(
+    callback: CallbackQuery, bot: Bot, settings: TelegramSettings
+) -> None:
+    await callback.answer()
+    preset_key = (callback.data or "").split(":", 1)[1]
+    chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
+
+    session = job_sessions.get(chat_id)
+    if not session or time.monotonic() > session.expires_at:
+        if callback.message:
+            await callback.message.answer("Сессия истекла, отправьте аудио заново.")
+        return
+
+    # Refresh TTL
+    session.expires_at = time.monotonic() + SESSION_TTL_SECONDS
+
+    if preset_key == "sentences":
+        transcript_dir = Path(session.base_options.transcript_dir) / session.audio_path.stem
+        sentences_path = transcript_dir / "sentences.txt"
+        if sentences_path.exists():
+            await callback.message.answer_document(FSInputFile(path=str(sentences_path)))
+        else:
+            await callback.message.answer("Файл не найден, отправьте аудио заново.")
+        return
+
+    opts = apply_preset(session.base_options, preset_key)
+    # Reuse same output_docx path (overwrites previous result)
+    opts.output_docx = session.base_options.output_docx
+
+    status_message = await callback.message.answer(
+        f"⏳ Повторная обработка ({PRESETS[preset_key]['label']})…"
+    )
+    progress = _make_progress()
+
+    success = await run_pipeline_and_send(
+        chat_id=chat_id,
+        audio_path=session.audio_path,
+        opts=opts,
+        status_message=status_message,
+        reply_target=callback.message,
+        progress=progress,
+    )
+
+    if not success:
+        logging.error("Failed to retry audio processing for chat_id=%s preset=%s", chat_id, preset_key)
+        await callback.message.answer(
+            "Извините, не получилось обработать аудио при повторной попытке 😔"
+        )
+
+
+async def handle_consent_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
+    if chat_id not in consented_users:
+        consented_users.add(chat_id)
+        save_consent(chat_id)
+        logging.info("Consent accepted for chat_id=%s", chat_id)
+    if callback.message:
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(
+            "✅ Соглашение принято. Отправьте голосовое сообщение или аудиофайл 📄"
+        )
+
+
+async def session_cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(600)  # 10 min
+        now = time.monotonic()
+        expired = [cid for cid, s in list(job_sessions.items()) if now > s.expires_at]
+        for cid in expired:
+            session = job_sessions.pop(cid, None)
+            if session:
+                logging.info("Cleaning up expired session for chat_id=%s", cid)
+                cleanup_work_dir(session.work_dir)
 
 
 def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
@@ -320,12 +589,22 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
 
     @dp.message(CommandStart())
     async def handle_start(message: Message) -> None:
-        await message.answer(
-            "Здравствуйте! 👋\n"
-            "Я с радостью помогу обработать аудио.\n"
-            "Отправьте голосовое сообщение или аудиофайл, "
-            "и я верну TXT и DOCX 📄"
-        )
+        chat_id = message.chat.id if message.chat else 0
+        if chat_id in consented_users:
+            await message.answer(
+                "Здравствуйте! 👋 Вы уже приняли соглашение.\n"
+                "Отправьте голосовое сообщение или аудиофайл 📄"
+            )
+        else:
+            await message.answer(
+                CONSENT_TEXT,
+                parse_mode="MarkdownV2",
+                reply_markup=build_consent_keyboard(),
+            )
+
+    @dp.callback_query(F.data == "consent:accept")
+    async def handle_consent(callback: CallbackQuery) -> None:
+        await handle_consent_callback(callback)
 
     @dp.message(F.voice)
     async def handle_voice(message: Message, bot: Bot) -> None:
@@ -339,18 +618,25 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
     async def handle_document(message: Message, bot: Bot) -> None:
         await process_and_reply(message, bot, settings)
 
+    @dp.callback_query(F.data.startswith("retry:"))
+    async def handle_retry(callback: CallbackQuery, bot: Bot) -> None:
+        await handle_retry_callback(callback, bot, settings)
+
     return dp
 
 
 async def run_bot() -> None:
     settings = load_settings()
     ensure_temp_root()
+    load_consents()
     logging.info("Starting Telegram bot polling")
     bot = create_bot(settings)
     dp = create_dispatcher(settings)
+    cleanup_task = asyncio.create_task(session_cleanup_loop())
     try:
         await dp.start_polling(bot)
     finally:
+        cleanup_task.cancel()
         await bot.session.close()
 
 

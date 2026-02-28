@@ -14,6 +14,7 @@ telegram-bot-api-data/
 victoria-metrics-data/
 grafana-data/
 transcripts/
+consents/
 
 # Infra build artifacts
 infra/*.tar.gz
