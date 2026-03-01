@@ -33,7 +33,7 @@ def map_speakers_to_roles(
     mapping: Dict[str, str] = {}
     order: List[str] = []
     for replica in replicas:
-        speaker = replica["speaker"]
+        speaker = replica['speaker']
         if speaker in mapping:
             continue
         if speaker in explicit_map:
@@ -41,7 +41,24 @@ def map_speakers_to_roles(
         else:
             order.append(speaker)
 
-    roles = ["К", "Т"]
+    if len(order) >= 2:
+        volume: Dict[str, int] = {}
+        for replica in replicas:
+            speaker = replica['speaker']
+            if speaker in order:
+                volume[speaker] = volume.get(speaker, 0) + len(replica.get('text', ''))
+        sorted_by_volume = sorted(order, key=lambda s: volume.get(s, 0), reverse=True)
+        top = volume.get(sorted_by_volume[0], 0)
+        second = volume.get(sorted_by_volume[1], 0)
+        total = top + second
+        if total > 0 and (top - second) / total > 0.2:
+            mapping[sorted_by_volume[0]] = 'К'
+            mapping[sorted_by_volume[1]] = 'Т'
+            for idx, speaker in enumerate(sorted_by_volume[2:], start=2):
+                mapping[speaker] = ['К', 'Т'][idx % 2]
+            return mapping
+
+    roles = ['К', 'Т']
     for idx, speaker in enumerate(order):
         mapping[speaker] = roles[idx % len(roles)]
 

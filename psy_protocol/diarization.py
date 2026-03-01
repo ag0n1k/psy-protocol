@@ -1,4 +1,5 @@
 import logging
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,6 +9,8 @@ import mlx.nn as nn
 import numpy as np
 import torch
 import torchaudio
+if not hasattr(torchaudio, 'list_audio_backends'):
+    torchaudio.list_audio_backends = lambda: []
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import RemoteEntryNotFoundError
 
@@ -460,8 +463,6 @@ def compute_mfcc_embedding(
 
 
 def load_speaker_embedding_model(model_id: str, device: str) -> Any:
-    if not hasattr(torchaudio, "list_audio_backends"):
-        torchaudio.list_audio_backends = lambda: []
     import huggingface_hub
     if "use_auth_token" not in huggingface_hub.hf_hub_download.__code__.co_varnames:
         original_download = huggingface_hub.hf_hub_download
@@ -489,10 +490,17 @@ def load_speaker_embedding_model(model_id: str, device: str) -> Any:
     logging.info("Embeddings: loading model %s (%s)", model_id, device)
     sb_fetching.fetch = fetch_compat
     sb_interfaces.fetch = fetch_compat
-    return EncoderClassifier.from_hparams(
-        source=model_id,
-        run_opts={"device": device},
-    )
+    # Audio is loaded externally; speechbrain never loads files itself in this pipeline.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='SpeechBrain could not find any working torchaudio backend',
+            module='speechbrain',
+        )
+        return EncoderClassifier.from_hparams(
+            source=model_id,
+            run_opts={"device": device},
+        )
 
 
 def compute_ecapa_embedding(
@@ -571,6 +579,77 @@ def kmeans_cluster(
     return labels
 
 
+def _log_cluster_separation(embeddings: np.ndarray, labels: np.ndarray) -> None:
+    mask0, mask1 = labels == 0, labels == 1
+    if mask0.sum() > 1 and mask1.sum() > 1:
+        within = (
+            (embeddings[mask0] @ embeddings[mask0].T).mean()
+            + (embeddings[mask1] @ embeddings[mask1].T).mean()
+        ) / 2
+        between = (embeddings[mask0] @ embeddings[mask1].T).mean()
+        logging.info(
+            'Cluster sep: within=%.3f between=%.3f delta=%.3f',
+            within,
+            between,
+            within - between,
+        )
+
+
+def spectral_cluster_2(embeddings: np.ndarray) -> np.ndarray:
+    """Spectral clustering for k=2 using eigenvector k-means on 2D spectral embedding."""
+    n = embeddings.shape[0]
+    if n <= 2:
+        return np.arange(n, dtype=int)
+
+    # Cosine affinity: for normalized embeddings = dot product
+    W = embeddings @ embeddings.T        # [-1, 1]
+    W = (W + 1.0) / 2.0                 # → [0, 1]
+    np.fill_diagonal(W, 0.0)
+
+    # Normalized Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
+    d = W.sum(axis=1)
+    d_inv_sqrt = np.where(d > 1e-10, 1.0 / np.sqrt(d), 0.0)
+    L_sym = np.eye(n) - d_inv_sqrt[:, None] * W * d_inv_sqrt[None, :]
+
+    _, vecs = np.linalg.eigh(L_sym)
+    # Take 2 smallest eigenvectors (sklearn standard for spectral clustering)
+    spectral_embedding = vecs[:, :2]
+    # Row-normalize (sklearn standard)
+    norms = np.linalg.norm(spectral_embedding, axis=1, keepdims=True)
+    spectral_embedding = spectral_embedding / np.where(norms > 1e-10, norms, 1.0)
+
+    # K-means on 2D spectral embedding — more robust than gap-based threshold
+    labels = kmeans_cluster(spectral_embedding, k=2)
+
+    fiedler = vecs[:, 1]
+    sorted_vals = np.sort(fiedler)
+    gaps = np.diff(sorted_vals)
+    logging.info(
+        'Spectral: max_gap=%.4f, cluster_sizes=%s',
+        gaps.max(),
+        str(np.bincount(labels).tolist()),
+    )
+    _log_cluster_separation(embeddings, labels)
+    return labels
+
+
+def agglomerative_cluster_2(embeddings: np.ndarray) -> np.ndarray:
+    """Agglomerative clustering with average linkage and cosine distance for k=2."""
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import pdist
+
+    n = embeddings.shape[0]
+    if n <= 2:
+        return np.arange(n, dtype=int)
+
+    dist = pdist(embeddings, metric='cosine')
+    Z = linkage(dist, method='average')
+    labels = fcluster(Z, t=2, criterion='maxclust') - 1  # fcluster starts from 1
+    logging.info('Agglomerative: cluster_sizes=%s', str(np.bincount(labels).tolist()))
+    _log_cluster_separation(embeddings, labels)
+    return labels
+
+
 def remap_labels_by_first_occurrence(labels: np.ndarray) -> np.ndarray:
     mapping: Dict[int, int] = {}
     next_id = 0
@@ -615,6 +694,7 @@ def cluster_segments_by_embeddings(
     num_speakers: int,
     embedding_model_id: str,
     embedding_device: str,
+    clustering_method: str = 'kmeans',
 ) -> List[SpeakerSegment]:
     if not segments:
         return []
@@ -670,7 +750,15 @@ def cluster_segments_by_embeddings(
     embeddings_np = np.vstack(embeddings)
     k = num_speakers if num_speakers and num_speakers > 0 else 1
     k = min(k, embeddings_np.shape[0])
-    labels = kmeans_cluster(embeddings_np, k)
+    if k == 2 and clustering_method == 'spectral':
+        logging.info('Clustering: using spectral (eigvec k-means, k=2)')
+        labels = spectral_cluster_2(embeddings_np)
+    elif k == 2 and clustering_method == 'agglomerative':
+        logging.info('Clustering: using agglomerative (average cosine, k=2)')
+        labels = agglomerative_cluster_2(embeddings_np)
+    else:
+        logging.info('Clustering: using k-means (k=%d)', k)
+        labels = kmeans_cluster(embeddings_np, k)
     labels = remap_labels_by_first_occurrence(labels)
 
     full_labels = assign_missing_labels_by_nearest(segments, indices, labels)
@@ -731,15 +819,63 @@ def merge_sandwiched_segments(
     return segments
 
 
+def diarize_with_pyannote_pipeline(
+    audio_path: str,
+    num_speakers: int = 2,
+    pipeline_model: str = 'pyannote/speaker-diarization-3.1',
+    hf_token: Optional[str] = None,
+) -> List[SpeakerSegment]:
+    from pyannote.audio import Pipeline
+
+    logging.info('Pyannote pipeline: loading %s', pipeline_model)
+    pipeline = Pipeline.from_pretrained(pipeline_model)
+
+    # Load via torchaudio to avoid sample-count mismatch with compressed formats (ogg, mp3).
+    # Pyannote reads duration from metadata and expects an exact sample count; decoding
+    # compressed audio often yields slightly fewer samples, causing a ValueError.
+    waveform, sr = torchaudio.load(audio_path)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != 16000:
+        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+        sr = 16000
+
+    logging.info('Pyannote pipeline: running diarization')
+    diarization = pipeline({'waveform': waveform, 'sample_rate': sr}, num_speakers=num_speakers)
+
+    # pyannote 4.x returns DiarizeOutput; older versions return Annotation directly
+    annotation = getattr(diarization, 'speaker_diarization', diarization)
+
+    segments = []
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
+        segments.append(SpeakerSegment(start=turn.start, end=turn.end, speaker=speaker))
+
+    if segments:
+        label_map = {}
+        next_id = 0
+        for seg in segments:
+            if seg.speaker not in label_map:
+                label_map[seg.speaker] = f'SPEAKER_{next_id:02d}'
+                next_id += 1
+        segments = [SpeakerSegment(s.start, s.end, label_map[s.speaker]) for s in segments]
+
+    logging.info('Pyannote pipeline: %d segments', len(segments))
+    return segments
+
+
 def post_process_diarization(
     segments: List[SpeakerSegment],
     merge_gap: float,
     sandwich_max_duration: float,
 ) -> List[SpeakerSegment]:
-    segments = merge_segments(segments, gap=merge_gap)
-    segments = merge_sandwiched_segments(
-        segments,
-        max_duration=sandwich_max_duration,
-        max_gap=merge_gap,
-    )
+    for _ in range(10):
+        prev_count = len(segments)
+        segments = merge_segments(segments, gap=merge_gap)
+        segments = merge_sandwiched_segments(
+            segments,
+            max_duration=sandwich_max_duration,
+            max_gap=merge_gap,
+        )
+        if len(segments) == prev_count:
+            break
     return segments

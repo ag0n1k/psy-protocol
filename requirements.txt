@@ -8,3 +8,4 @@ speechbrain
 python-docx
 huggingface_hub
 aiogram
+# pyannote.audio>=3.1  # optional: only for diarization_method=pyannote_pipeline

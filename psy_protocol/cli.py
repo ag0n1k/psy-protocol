@@ -2,6 +2,7 @@ import argparse
 import logging
 
 from .config import (
+    DEFAULT_DIARIZATION_METHOD,
     DEFAULT_DIARIZATION_MODEL,
     DEFAULT_SPEAKER_EMBEDDING_DEVICE,
     DEFAULT_SPEAKER_EMBEDDING_MODEL,
@@ -118,16 +119,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Уровень логирования (DEBUG, INFO, WARNING, ERROR)",
     )
     parser.add_argument(
-        "--force-whisper",
-        action="store_true",
-        help="Перезапустить Whisper и обновить кэш",
+        '--force-whisper',
+        action='store_true',
+        help='Перезапустить Whisper и обновить кэш',
     )
     parser.add_argument(
-        "--no-word-timestamps",
-        action="store_false",
-        dest="word_timestamps",
+        '--force-diarization',
+        action='store_true',
+        help='Перезапустить диаризацию и обновить кэш',
+    )
+    parser.add_argument(
+        '--no-word-timestamps',
+        action='store_false',
+        dest='word_timestamps',
         default=True,
-        help="Отключить word timestamps в Whisper",
+        help='Отключить word timestamps в Whisper',
+    )
+    parser.add_argument(
+        '--diarization-method',
+        default=DEFAULT_DIARIZATION_METHOD,
+        choices=['custom_mlx', 'pyannote_pipeline'],
+        help='Метод диаризации (по умолчанию: custom_mlx)',
+    )
+    parser.add_argument(
+        '--clustering-method',
+        default='kmeans',
+        choices=['kmeans', 'spectral', 'agglomerative'],
+        help='Метод кластеризации спикеров',
+    )
+    parser.add_argument(
+        '--swap',
+        action='store_true',
+        help='Поменять К↔Т (shortcut для --speaker-map SPEAKER_00=Т,SPEAKER_01=К)',
     )
     return parser
 
@@ -136,12 +159,15 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     logging.basicConfig(level=args.log_level.upper(), format=LOG_FORMAT)
+    speaker_map = args.speaker_map
+    if args.swap and not speaker_map:
+        speaker_map = 'SPEAKER_00=Т,SPEAKER_01=К'
     options = ProcessingOptions(
         output_docx=args.output_docx,
         transcript_dir=args.transcript_dir,
         whisper_model=args.whisper_model,
         diarization_model=args.diarization_model,
-        speaker_map=args.speaker_map,
+        speaker_map=speaker_map,
         fio=args.fio,
         group=args.group,
         date=args.date,
@@ -159,6 +185,9 @@ def main() -> None:
         chunk_size=args.chunk_size,
         overlap=args.overlap,
         force_whisper=args.force_whisper,
+        force_diarization=args.force_diarization,
         word_timestamps=args.word_timestamps,
+        diarization_method=args.diarization_method,
+        clustering_method=args.clustering_method,
     )
     process_audio_file(args.audio, options)

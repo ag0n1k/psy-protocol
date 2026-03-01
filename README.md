@@ -16,6 +16,8 @@ CLI tool to transcribe audio with Whisper-MLX, diarize speakers with the
 python app.py --audio /path/to/audio.wav
 ```
 
+https://huggingface.co/mlx-community/pyannote-segmentation-3.0-mlx
+
 Outputs:
 
 - `<audio>.docx` (filled table)

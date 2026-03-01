@@ -53,6 +53,17 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     "sentences": {
         "label": "📝 По фразам",
     },
+    "swap": {
+        "label": "🔄 Поменять К↔Т",
+        "speaker_map": "SPEAKER_00=Т,SPEAKER_01=К",
+        "force_diarization": False,
+    },
+    "raw_text": {
+        "label": "📄 Сырой текст",
+    },
+    "timed": {
+        "label": "⏱ С таймкодами",
+    },
 }
 
 CONSENT_TEXT = """📋 *Пользовательское соглашение*
@@ -196,6 +207,7 @@ def build_processing_options(
     options = ProcessingOptions(
         output_docx=output_docx,
         transcript_dir=cache_dir,
+        diarization_method='custom_mlx',
     )
     if settings.whisper_model:
         options.whisper_model = settings.whisper_model
@@ -227,24 +239,38 @@ def build_retry_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=PRESETS["large_model"]["label"],
-                    callback_data="retry:large_model",
+                    text=PRESETS['large_model']['label'],
+                    callback_data='retry:large_model',
                 ),
                 InlineKeyboardButton(
-                    text=PRESETS["noisy"]["label"],
-                    callback_data="retry:noisy",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=PRESETS["interrupts"]["label"],
-                    callback_data="retry:interrupts",
+                    text=PRESETS['noisy']['label'],
+                    callback_data='retry:noisy',
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text=PRESETS["sentences"]["label"],
-                    callback_data="retry:sentences",
+                    text=PRESETS['interrupts']['label'],
+                    callback_data='retry:interrupts',
+                ),
+                InlineKeyboardButton(
+                    text=PRESETS['swap']['label'],
+                    callback_data='retry:swap',
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=PRESETS['sentences']['label'],
+                    callback_data='retry:sentences',
+                ),
+                InlineKeyboardButton(
+                    text=PRESETS['timed']['label'],
+                    callback_data='retry:timed',
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=PRESETS['raw_text']['label'],
+                    callback_data='retry:raw_text',
                 ),
             ],
         ]
@@ -524,13 +550,18 @@ async def handle_retry_callback(
     # Refresh TTL
     session.expires_at = time.monotonic() + SESSION_TTL_SECONDS
 
-    if preset_key == "sentences":
+    if preset_key in ('sentences', 'raw_text', 'timed'):
         transcript_dir = Path(session.base_options.transcript_dir) / session.audio_path.stem
-        sentences_path = transcript_dir / "sentences.txt"
-        if sentences_path.exists():
-            await callback.message.answer_document(FSInputFile(path=str(sentences_path)))
+        file_map = {
+            'sentences': transcript_dir / 'sentences.txt',
+            'raw_text': transcript_dir / 'transcript.txt',
+            'timed': transcript_dir / 'timed_dialogue.txt',
+        }
+        file_path = file_map[preset_key]
+        if file_path.exists():
+            await callback.message.answer_document(FSInputFile(path=str(file_path)))
         else:
-            await callback.message.answer("Файл не найден, отправьте аудио заново.")
+            await callback.message.answer('Файл не найден, отправьте аудио заново.')
         return
 
     opts = apply_preset(session.base_options, preset_key)
