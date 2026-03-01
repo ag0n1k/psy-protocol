@@ -22,8 +22,6 @@ def parse_speaker_map(value: Optional[str]) -> Dict[str, str]:
             raise ValueError(f"Invalid role for {raw_key}: {raw_value}")
         if key.isdigit():
             key = f"SPEAKER_{int(key):02d}"
-        if key.startswith("SPEAKER_"):
-            key = key
         mapping[key] = role
     return mapping
 

@@ -8,15 +8,6 @@ This directory contains scripts to deploy only Docker services from `docker-comp
 
 The Python bot is not deployed.
 
-## Build archive locally
-
-```sh
-./infra/build_bundle.sh
-```
-
-Creates `infra/psy-protocol-infra-<timestamp>.tar.gz` with required files.
-The bundle includes `docker-compose.yml` and `infra/monitoring/*` configs.
-
 ## Deploy to SSH server
 
 ```sh

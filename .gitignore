@@ -15,6 +15,7 @@ victoria-metrics-data/
 grafana-data/
 transcripts/
 consents/
+tests/
 
 # Infra build artifacts
 infra/*.tar.gz

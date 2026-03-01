@@ -190,7 +190,9 @@ def create_bot(settings: TelegramSettings) -> Bot:
     return Bot(token=settings.token, session=session)
 
 
-def build_processing_options(settings: TelegramSettings, output_docx: Path, cache_dir: Path) -> ProcessingOptions:
+def build_processing_options(
+    settings: TelegramSettings, output_docx: Path, cache_dir: Path,
+) -> ProcessingOptions:
     options = ProcessingOptions(
         output_docx=output_docx,
         transcript_dir=cache_dir,
@@ -264,7 +266,9 @@ def build_work_paths(message: Message, suffix: str) -> Tuple[Path, Path, Path]:
     return work_dir, audio_path, output_docx
 
 
-async def download_audio(message: Message, bot: Bot, settings: TelegramSettings) -> Optional[Tuple[Path, Path, Path]]:
+async def download_audio(
+    message: Message, bot: Bot, settings: TelegramSettings,
+) -> Optional[Tuple[Path, Path, Path]]:
     file_id: Optional[str] = None
     suffix = ".audio"
 
@@ -289,12 +293,6 @@ async def download_audio(message: Message, bot: Bot, settings: TelegramSettings)
     work_dir, audio_path, output_docx = build_work_paths(message, suffix)
     tg_file = await bot.get_file(file_id)
     file_path = tg_file.file_path or ""
-    # Remote Bot API server running with --local returns absolute filesystem paths.
-    # Strip the server root so aiogram builds a valid relative HTTP download URL.
-    # if not settings.api_is_local and file_path.startswith("/"):
-        # server_root = settings.local_server_file_root.rstrip("/") + "/"
-        # if file_path.startswith(server_root):
-        #     file_path = file_path[len(server_root):]
     await bot.download_file(file_path, destination=audio_path)
     return work_dir, audio_path, output_docx
 
@@ -356,7 +354,9 @@ def render_progress_text(progress: Dict[str, Any]) -> str:
     )
 
 
-async def progress_updater(status_message: Message, progress: Dict[str, Any], interval_seconds: int = 5) -> None:
+async def progress_updater(
+    status_message: Message, progress: Dict[str, Any], interval_seconds: int = 5,
+) -> None:
     last_text = ""
     while not progress.get("done"):
         text = render_progress_text(progress)

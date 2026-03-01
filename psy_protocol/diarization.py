@@ -486,7 +486,7 @@ def load_speaker_embedding_model(model_id: str, device: str) -> Any:
                 raise ValueError("optional custom.py not found") from exc
             raise
 
-    logging.info("Эмбеддинги: загрузка модели %s (%s)", model_id, device)
+    logging.info("Embeddings: loading model %s (%s)", model_id, device)
     sb_fetching.fetch = fetch_compat
     sb_interfaces.fetch = fetch_compat
     return EncoderClassifier.from_hparams(
@@ -619,7 +619,7 @@ def cluster_segments_by_embeddings(
     if not segments:
         return []
 
-    logging.info("Кластеризация: входных сегментов %d", len(segments))
+    logging.info("Clustering: input segments %d", len(segments))
     classifier = load_speaker_embedding_model(embedding_model_id, embedding_device)
 
     embeddings: List[np.ndarray] = []
@@ -637,9 +637,9 @@ def cluster_segments_by_embeddings(
         embeddings.append(embedding)
         indices.append(idx)
 
-    logging.info("Кластеризация: эмбеддингов %d", len(embeddings))
+    logging.info("Clustering: embeddings count %d", len(embeddings))
     if not embeddings:
-        logging.warning("Кластеризация: эмбеддинги не получены, fallback MFCC")
+        logging.warning("Clustering: no embeddings obtained, fallback to MFCC")
         mfcc_transform = torchaudio.transforms.MFCC(
             sample_rate=sample_rate,
             n_mfcc=DEFAULT_EMBEDDING_N_MFCC,

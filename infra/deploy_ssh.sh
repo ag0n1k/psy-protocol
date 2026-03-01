@@ -4,21 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  infra/deploy_ssh.sh <user@host> [remote_dir]
-
-Description:
-  1) Packs infra files into infra/*.tar.gz
-  2) Uploads archive via scp
-  3) Extracts on remote server
-  4) Runs docker compose for:
-     - telegram-bot-api
-     - victoria-metrics
-     - grafana
-
-Notes:
-  - Bot app is NOT deployed.
-  - If .env does not exist on remote, script copies infra/.env.server.example to .env
-    and exits with a reminder to edit credentials first.
+  infra/deploy_ssh.sh <user@host>
 EOF
 }
 
@@ -47,8 +33,8 @@ ssh $TARGET "mkdir -p ~/${REMOTE_DIR}/infra/monitoring/grafana/dashboards/"
 
 scp -O infra/monitoring/prometheus.yml "${TARGET}:${REMOTE_DIR}/infra/monitoring/prometheus.yml"
 scp -O infra/.env.server.example "${TARGET}:${REMOTE_DIR}/.env.example"
-scp -O infra/monitoring/grafana/provisioning/datasources/victoriametrics.yml "${TARGET}:${REMOTE_DIR}/infra/monitoring/grafana/provisioning/datasources/victoriametrics.yml"
 scp -O infra/monitoring/grafana/provisioning/dashboards/default.yml "${TARGET}:${REMOTE_DIR}/infra/monitoring/grafana/provisioning/dashboards/default.yml"
+scp -O infra/monitoring/grafana/provisioning/datasources/victoriametrics.yml "${TARGET}:${REMOTE_DIR}/infra/monitoring/grafana/provisioning/datasources/victoriametrics.yml"
 scp -O infra/monitoring/grafana/dashboards/telegram-bot-api-overview.json "${TARGET}:${REMOTE_DIR}/infra/monitoring/grafana/dashboards/telegram-bot-api-overview.json"
 scp -O infra/nginx/default.conf "${TARGET}:${REMOTE_DIR}/infra/nginx/default.conf"
 
@@ -59,7 +45,7 @@ set -euo pipefail
 cd "${REMOTE_DIR}"
 
 if [[ ! -f ".env" ]]; then
-  cp infra/.env.server.example .env
+  cp .env.example .env
   echo "Created .env from infra/.env.server.example"
   echo "Please fill TELEGRAM_API_ID and TELEGRAM_API_HASH in ${REMOTE_DIR}/.env, then rerun deploy."
   exit 2

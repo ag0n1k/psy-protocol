@@ -16,28 +16,61 @@ services:
       - "${TELEGRAM_LOCAL_API_PORT:-8081}:8081"
       - "8082:8082"
     volumes:
-      - ${TELEGRAM_LOCAL_HOST_FILE_ROOT:-./telegram-bot-api-data}:/var/lib/telegram-bot-api
+      - ${TELEGRAM_LOCAL_HOST_FILE_ROOT:-./mounts/telegram-bot-api-data}:/var/lib/telegram-bot-api
+
+  nginx:
+    image: nginx:1.27.3-alpine
+    container_name: nginx
+    restart: unless-stopped
+    volumes:
+      - ./mounts/telegram-bot-api-data:/var/lib/telegram-bot-api
+      - ./infra/nginx:/etc/nginx/conf.d/
+    ports:
+      - "8020:80"
 
   victoria-metrics:
     image: victoriametrics/victoria-metrics:latest
     container_name: victoria-metrics
+    user: "${LOCAL_USER_ID}"
     restart: unless-stopped
     command:
       - --storageDataPath=/victoria-metrics-data
       - --httpListenAddr=:8428
+      - -promscrape.suppressScrapeErrors
       - --promscrape.config=/etc/victoriametrics/prometheus.yml
     ports:
       - "${VICTORIA_METRICS_PORT:-8428}:8428"
     volumes:
-      - ${VICTORIA_METRICS_DATA_DIR:-./victoria-metrics-data}:/victoria-metrics-data
+      - ${VICTORIA_METRICS_DATA_DIR:-./mounts/victoria-metrics-data}:/victoria-metrics-data
       - ./infra/monitoring/prometheus.yml:/etc/victoriametrics/prometheus.yml:ro
+
+  node-exporter:
+    image: quay.io/prometheus/node-exporter:latest
+    container_name: node_exporter
+    restart: unless-stopped
+    privileged: true        # Required on Synology DSM for host access
+    network_mode: host      # Exposes :9100 directly; no port mapping needed
+    pid: host               # Required for correct process/CPU metrics
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro     # No rslave — Synology DSM doesn't support shared mount propagation
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/host/root"
+      - "--web.listen-address=:9100"
+      # Exclude redundant/virtual mount points by path
+      # Keeps: / (md0), /volume1, /volumeUSB1/usbshare, /volumeUSB2/usbshare
+      - "--collector.filesystem.mount-points-exclude=^/(host/)?(dev|proc|sys|run|tmp|var/lib/docker|volume1/@appdata)($$|/)"
+      # Exclude virtual filesystem types
+      - "--collector.filesystem.fs-types-exclude=^(tmpfs|devtmpfs|sysfs|proc|cgroup|autofs|configfs|debugfs|devpts|fusectl|hugetlbfs|mqueue|nsfs|overlay|pstore|rpc_pipefs|securityfs|squashfs|tracefs)($$|/)"
 
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     restart: unless-stopped
-    depends_on:
-      - victoria-metrics
+    user: "${LOCAL_USER_ID}"
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
@@ -45,6 +78,6 @@ services:
     ports:
       - "${GRAFANA_PORT:-3000}:3000"
     volumes:
-      - ${GRAFANA_DATA_DIR:-./grafana-data}:/var/lib/grafana
+      - ${GRAFANA_DATA_DIR:-./mounts/grafana-data}:/var/lib/grafana
       - ./infra/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./infra/monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
