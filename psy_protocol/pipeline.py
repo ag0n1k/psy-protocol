@@ -9,6 +9,7 @@ from .config import (
     DEFAULT_DIARIZATION_METHOD,
     DEFAULT_DIARIZATION_MODEL,
     DEFAULT_EMBEDDING_MIN_DURATION,
+    DEFAULT_LLM_DIARIZATION_MODEL,
     DEFAULT_PYANNOTE_PIPELINE_MODEL,
     DEFAULT_SPEAKER_EMBEDDING_DEVICE,
     DEFAULT_SPEAKER_EMBEDDING_MODEL,
@@ -25,6 +26,7 @@ from .diarization import (
     load_audio,
     post_process_diarization,
 )
+from .llm_diarization import diarize_with_llm
 from .docx_writer import create_docx
 from .io_utils import load_json, save_json, save_text
 from .roles import map_speakers_to_roles, parse_speaker_map
@@ -60,9 +62,10 @@ class ProcessingOptions:
     force_diarization: bool = False
     word_timestamps: bool = True
     clustering_method: str = 'kmeans'  # 'kmeans' | 'spectral' | 'agglomerative'
-    diarization_method: str = DEFAULT_DIARIZATION_METHOD  # 'pyannote_pipeline' | 'custom_mlx' | 'aufklarer_mlx'
+    diarization_method: str = DEFAULT_DIARIZATION_METHOD  # 'pyannote_pipeline' | 'custom_mlx' | 'aufklarer_mlx' | 'llm'
     pyannote_pipeline_model: str = DEFAULT_PYANNOTE_PIPELINE_MODEL
     aufklarer_mlx_model: str = DEFAULT_AUFKLARER_MLX_MODEL
+    llm_diarization_model: str = DEFAULT_LLM_DIARIZATION_MODEL
     hf_token: Optional[str] = None
 
 
@@ -188,6 +191,10 @@ def process_audio_file(
             cache_valid = (
                 params.get("pipeline_model") == opts.pyannote_pipeline_model
             )
+        if cache_valid and opts.diarization_method == 'llm':
+            cache_valid = (
+                params.get("llm_model") == opts.llm_diarization_model
+            )
         if not cache_valid:
             diarization_payload = None
 
@@ -236,6 +243,32 @@ def process_audio_file(
         )
         logging.info("Diarization: post-processing saved %s", diarization_post_path)
         emit("diarization", 92.0, "Diarization post-processing saved")
+    elif opts.diarization_method == 'llm':
+        emit("diarization", 86.0, "Running LLM diarization")
+        diarization_segments = diarize_with_llm(
+            whisper_segments,
+            model_path=opts.llm_diarization_model,
+        )
+        logging.info("Diarization: LLM segments %d", len(diarization_segments))
+        save_json(
+            diarization_post_path,
+            {
+                "method": "llm_v1",
+                "segments": [
+                    {"start": s.start, "end": s.end, "speaker": s.speaker}
+                    for s in diarization_segments
+                ],
+                "params": {
+                    "diarization_method": "llm",
+                    "num_speakers": opts.max_speakers,
+                    "merge_gap": opts.merge_gap,
+                    "sandwich_max_duration": opts.sandwich_max_duration,
+                    "llm_model": opts.llm_diarization_model,
+                },
+            },
+        )
+        logging.info("Diarization: LLM results saved %s", diarization_post_path)
+        emit("diarization", 92.0, "LLM diarization completed")
     else:
         is_aufklarer = opts.diarization_method == 'aufklarer_mlx'
         diarization_raw_path = transcript_dir / "diarization.json"
@@ -371,6 +404,8 @@ def process_audio_file(
     logging.info('Replicas after postprocessing: %d', len(replicas))
     emit('replicas', 95.0, 'Building output replicas')
     explicit_map = parse_speaker_map(opts.speaker_map)
+    if opts.diarization_method == 'llm':
+        explicit_map = {'К': 'К', 'Т': 'Т'}
     role_map = map_speakers_to_roles(replicas, explicit_map)
     for replica in replicas:
         replica['role'] = role_map.get(replica['speaker'], 'К')

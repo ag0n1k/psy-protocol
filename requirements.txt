@@ -1,5 +1,6 @@
 mlx-whisper
 mlx
+mlx-lm
 numpy
 torch
 torchcodec

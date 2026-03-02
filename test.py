@@ -31,7 +31,7 @@ CONFIGS = {
 }
 
 CLUSTERING_METHODS = ['kmeans', 'spectral', 'agglomerative']
-DIARIZATION_METHODS = ['pyannote_pipeline', 'custom_mlx', 'aufklarer_mlx']
+DIARIZATION_METHODS = ['pyannote_pipeline', 'custom_mlx', 'aufklarer_mlx', 'llm']
 
 
 def parse_dialogue(path: Path) -> List[Tuple[str, str]]:
@@ -274,13 +274,21 @@ def main() -> None:
         action='store_true',
         help='Compare pyannote_pipeline vs custom_mlx diarization methods (Speaker%%)',
     )
+    parser.add_argument(
+        '--diarization-method',
+        nargs='+',
+        choices=DIARIZATION_METHODS,
+        metavar='METHOD',
+        help='Run only specific diarization methods (e.g. --diarization-method llm)',
+    )
     args = parser.parse_args()
 
     test_nums = args.test or TEST_NUMBERS
 
     if args.compare_diarization:
         all_results: Dict[str, List[Dict]] = {}
-        for method in DIARIZATION_METHODS:
+        methods = args.diarization_method or DIARIZATION_METHODS
+        for method in methods:
             options = dataclasses.replace(
                 ProcessingOptions(),
                 diarization_method=method,

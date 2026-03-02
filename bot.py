@@ -58,6 +58,11 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "speaker_map": "SPEAKER_00=Т,SPEAKER_01=К",
         "force_diarization": False,
     },
+    "llm_diarize": {
+        "label": "🧠 LLM-диаризация",
+        "diarization_method": "llm",
+        "force_diarization": True,
+    },
     "raw_text": {
         "label": "📄 Сырой текст",
     },
@@ -66,7 +71,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-CONSENT_TEXT = """📋 *Пользовательское соглашение*
+CONSENT_TEXT = r"""📋 *Пользовательское соглашение*
 
 Перед использованием бота ознакомьтесь с условиями обработки данных\.
 
@@ -268,6 +273,10 @@ def build_retry_keyboard() -> InlineKeyboardMarkup:
                 ),
             ],
             [
+                InlineKeyboardButton(
+                    text=PRESETS['llm_diarize']['label'],
+                    callback_data='retry:llm_diarize',
+                ),
                 InlineKeyboardButton(
                     text=PRESETS['raw_text']['label'],
                     callback_data='retry:raw_text',
