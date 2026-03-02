@@ -50,6 +50,8 @@ class SincConv1d(nn.Module):
         self.min_band_hz = min_band_hz
         self.stride = stride
         self.half_kernel = kernel_size // 2
+        # Pre-computed static filters in MLX format [C_out, K, C_in]; set by aufklarer loader.
+        self._static_filters: Optional[mx.array] = None
 
         self._initialize_filters()
         window = np.hamming(kernel_size)[: self.half_kernel]
@@ -113,9 +115,13 @@ class SincConv1d(nn.Module):
         if x.ndim == 2:
             x = mx.expand_dims(x, axis=1)
 
-        filters = self.get_filters()
         x_mlx = mx.transpose(x, (0, 2, 1))
-        filters_mlx = mx.transpose(filters, (0, 2, 1))
+        if self._static_filters is not None:
+            # Already in MLX [C_out, K, C_in] format — no transpose needed.
+            filters_mlx = self._static_filters
+        else:
+            filters = self.get_filters()
+            filters_mlx = mx.transpose(filters, (0, 2, 1))
         output = mx.conv1d(x_mlx, filters_mlx, stride=self.stride, padding=0)
         output = mx.transpose(output, (0, 2, 1))
         return output
@@ -264,9 +270,73 @@ class PyannoteSegmentationModel(nn.Module):
         self.classifier.bias = weights["classifier.bias"]
 
 
+    def load_weights_safetensors(self, weights_path: Path) -> None:
+        """Load weights from aufklarer/Pyannote-Segmentation-MLX (safetensors / MLX key names)."""
+        weights = mx.load(str(weights_path))
+
+        # SincConv: pre-computed filters stored in MLX [C_out, K, C_in] format.
+        if 'sincnet.conv.0.weight' in weights:
+            self.sincnet.sinc_conv._static_filters = weights['sincnet.conv.0.weight']
+
+        # Conv2 / Conv3 — already in MLX [C_out, K, C_in] format (no transpose).
+        for attr, key in (
+            (self.sincnet.conv2, 'sincnet.conv.1'),
+            (self.sincnet.conv3, 'sincnet.conv.2'),
+        ):
+            if f'{key}.weight' in weights:
+                attr.weight = weights[f'{key}.weight']
+            if f'{key}.bias' in weights:
+                attr.bias = weights[f'{key}.bias']
+
+        # Instance-norm layers.
+        for norm, key in (
+            (self.sincnet.norm1, 'sincnet.norm.0'),
+            (self.sincnet.norm2, 'sincnet.norm.1'),
+            (self.sincnet.norm3, 'sincnet.norm.2'),
+        ):
+            if f'{key}.weight' in weights:
+                norm.weight = weights[f'{key}.weight']
+            if f'{key}.bias' in weights:
+                norm.bias = weights[f'{key}.bias']
+
+        # LSTM layers — aufklarer stores Wx/Wh/bias per direction in lstm_fwd/lstm_bwd.
+        for i in range(4):
+            for lst, base in (
+                (self.lstm_forward, f'lstm_fwd.layers.{i}'),
+                (self.lstm_backward, f'lstm_bwd.layers.{i}'),
+            ):
+                if f'{base}.Wx' in weights:
+                    lst[i].Wx = weights[f'{base}.Wx']
+                if f'{base}.Wh' in weights:
+                    lst[i].Wh = weights[f'{base}.Wh']
+                if f'{base}.bias' in weights:
+                    lst[i].bias = weights[f'{base}.bias']
+
+        # Linear layers and classifier.
+        for attr, key in (
+            (self.linear1, 'linear.0'),
+            (self.linear2, 'linear.1'),
+        ):
+            if f'{key}.weight' in weights:
+                attr.weight = weights[f'{key}.weight']
+            if f'{key}.bias' in weights:
+                attr.bias = weights[f'{key}.bias']
+
+        if 'classifier.weight' in weights:
+            self.classifier.weight = weights['classifier.weight']
+        if 'classifier.bias' in weights:
+            self.classifier.bias = weights['classifier.bias']
+
+
 def load_pyannote_model(weights_path: Path) -> PyannoteSegmentationModel:
     model = PyannoteSegmentationModel()
     model.load_weights(weights_path)
+    return model
+
+
+def load_aufklarer_model(weights_path: Path) -> PyannoteSegmentationModel:
+    model = PyannoteSegmentationModel()
+    model.load_weights_safetensors(weights_path)
     return model
 
 
@@ -283,6 +353,22 @@ def resolve_diarization_weights(model_ref: str) -> Path:
         raise FileNotFoundError(f"Expected .npz file or directory, got {path}")
 
     weights_path = hf_hub_download(repo_id=model_ref, filename="weights.npz")
+    return Path(weights_path)
+
+
+def resolve_diarization_weights_safetensors(model_ref: str) -> Path:
+    path = Path(model_ref).expanduser()
+    if path.exists():
+        if path.is_dir():
+            weights = path / "model.safetensors"
+            if not weights.exists():
+                raise FileNotFoundError(f"Missing model.safetensors in {path}")
+            return weights
+        if path.suffix == ".safetensors":
+            return path
+        raise FileNotFoundError(f"Expected .safetensors file or directory, got {path}")
+
+    weights_path = hf_hub_download(repo_id=model_ref, filename="model.safetensors")
     return Path(weights_path)
 
 
@@ -418,6 +504,31 @@ def diarize_audio_raw(
 ) -> List[SpeakerSegment]:
     weights_path = resolve_diarization_weights(model_ref)
     model = load_pyannote_model(weights_path)
+    waveform, _ = load_audio(audio_path)
+    logits, frame_times = process_audio_chunks(
+        waveform,
+        model,
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
+    return logits_to_segments(
+        logits,
+        frame_times,
+        min_duration=min_duration,
+        silence_threshold=silence_threshold,
+    )
+
+
+def diarize_audio_raw_aufklarer(
+    audio_path: str,
+    model_ref: str,
+    min_duration: float,
+    chunk_size: int,
+    overlap: int,
+    silence_threshold: float,
+) -> List[SpeakerSegment]:
+    weights_path = resolve_diarization_weights_safetensors(model_ref)
+    model = load_aufklarer_model(weights_path)
     waveform, _ = load_audio(audio_path)
     logits, frame_times = process_audio_chunks(
         waveform,
@@ -829,6 +940,7 @@ def diarize_with_pyannote_pipeline(
 
     logging.info('Pyannote pipeline: loading %s', pipeline_model)
     pipeline = Pipeline.from_pretrained(pipeline_model)
+    pipeline.to(torch.device("mps"))
 
     # Load via torchaudio to avoid sample-count mismatch with compressed formats (ogg, mp3).
     # Pyannote reads duration from metadata and expects an exact sample count; decoding

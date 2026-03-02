@@ -2,6 +2,7 @@ DEFAULT_WHISPER_MODEL = "~/.cache/mlx/large-v3-turbo"
 DEFAULT_DIARIZATION_MODEL = "mlx-community/pyannote-segmentation-3.0-mlx"
 DEFAULT_DIARIZATION_METHOD = 'custom_mlx'
 DEFAULT_PYANNOTE_PIPELINE_MODEL = 'pyannote/speaker-diarization-3.1'
+DEFAULT_AUFKLARER_MLX_MODEL = 'aufklarer/Pyannote-Segmentation-MLX'
 
 DEFAULT_FONT_NAME = "Times New Roman"
 TABLE_FONT_NAME = "Calibri"

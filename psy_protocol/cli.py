@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--diarization-method',
         default=DEFAULT_DIARIZATION_METHOD,
-        choices=['custom_mlx', 'pyannote_pipeline'],
+        choices=['custom_mlx', 'pyannote_pipeline', 'aufklarer_mlx'],
         help='Метод диаризации (по умолчанию: custom_mlx)',
     )
     parser.add_argument(
