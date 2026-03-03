@@ -34,6 +34,7 @@ from .io_utils import load_json, save_json, save_text
 from .roles import map_speakers_to_roles, parse_speaker_map
 from .text_outputs import save_dialogue_txt, save_sentences_txt, save_timed_dialogue_txt
 from .text_postprocess import postprocess_replica_text
+from .audio_preprocess import preprocess_audio
 from .qwen_transcribe import transcribe_audio_qwen
 from .whisper_transcribe import extract_words, transcribe_audio
 
@@ -63,6 +64,7 @@ class ProcessingOptions:
     overlap: int = 16000
     force_whisper: bool = False
     force_diarization: bool = False
+    preprocess_audio: bool = True
     word_timestamps: bool = True
     clustering_method: str = 'kmeans'  # 'kmeans' | 'spectral' | 'agglomerative'
     diarization_method: str = DEFAULT_DIARIZATION_METHOD  # 'pyannote_pipeline' | 'custom_mlx' | 'aufklarer_mlx' | 'llm'
@@ -127,6 +129,16 @@ def process_audio_file(
     logging.info("Cache dir: %s", transcript_dir)
     emit("prepare", 5.0, "Prepared cache directory")
 
+    processed_audio_path = audio_path
+    if opts.preprocess_audio:
+        preprocessed_wav = transcript_dir / 'audio_preprocessed.wav'
+        if not preprocessed_wav.exists() or opts.force_whisper:
+            emit('prepare', 6.0, 'Preprocessing audio')
+            preprocess_audio(str(audio_path), str(preprocessed_wav))
+        else:
+            logging.info('Audio preprocessing: using cached %s', preprocessed_wav)
+        processed_audio_path = preprocessed_wav
+
     transcript_json_path = transcript_dir / "transcript.json"
     transcript_txt_path = transcript_dir / "transcript.txt"
     whisper_segments_path = transcript_dir / "whisper_segments.json"
@@ -155,7 +167,7 @@ def process_audio_file(
         if opts.transcription_method == 'qwen_asr':
             logging.info("Qwen ASR: starting transcription")
             whisper_result = transcribe_audio_qwen(
-                str(audio_path),
+                str(processed_audio_path),
                 opts.qwen_asr_model,
                 progress_callback=transcription_progress,
             )
@@ -164,7 +176,7 @@ def process_audio_file(
                 "Whisper: starting transcription (word_timestamps=%s)", use_word_timestamps,
             )
             whisper_result = transcribe_audio(
-                str(audio_path),
+                str(processed_audio_path),
                 opts.whisper_model,
                 word_timestamps=use_word_timestamps,
                 progress_callback=transcription_progress,
@@ -242,7 +254,7 @@ def process_audio_file(
     elif opts.diarization_method == 'pyannote_pipeline':
         emit("diarization", 86.0, "Running pyannote pipeline diarization")
         diarization_segments = diarize_with_pyannote_pipeline(
-            str(audio_path),
+            str(processed_audio_path),
             num_speakers=opts.max_speakers,
             pipeline_model=opts.pyannote_pipeline_model,
             hf_token=opts.hf_token,
@@ -333,7 +345,7 @@ def process_audio_file(
             emit("diarization", 86.0, "Running diarization segmentation")
             if is_aufklarer:
                 raw_segments = diarize_audio_raw_aufklarer(
-                    str(audio_path),
+                    str(processed_audio_path),
                     opts.aufklarer_mlx_model,
                     min_duration=opts.min_segment_duration,
                     chunk_size=opts.chunk_size,
@@ -342,7 +354,7 @@ def process_audio_file(
                 )
             else:
                 raw_segments = diarize_audio_raw(
-                    str(audio_path),
+                    str(processed_audio_path),
                     opts.diarization_model,
                     min_duration=opts.min_segment_duration,
                     chunk_size=opts.chunk_size,
@@ -367,7 +379,7 @@ def process_audio_file(
             )
             logging.info("Diarization: raw segments saved %s", diarization_raw_path)
 
-        waveform, sample_rate = load_audio(str(audio_path))
+        waveform, sample_rate = load_audio(str(processed_audio_path))
         logging.info("Diarization: raw segments count %d", len(raw_segments))
         emit("diarization", 90.0, "Clustering speaker segments")
         diarization_segments = cluster_segments_by_embeddings(
