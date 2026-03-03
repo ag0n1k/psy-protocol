@@ -4,7 +4,9 @@ import logging
 from .config import (
     DEFAULT_DIARIZATION_METHOD,
     DEFAULT_DIARIZATION_MODEL,
+    DEFAULT_MERGE_ADJACENT_ROLES,
     DEFAULT_QWEN_ASR_MODEL,
+    DEFAULT_QWEN_ROLE_VALIDATION_MODEL,
     DEFAULT_SPEAKER_EMBEDDING_DEVICE,
     DEFAULT_SPEAKER_EMBEDDING_MODEL,
     DEFAULT_TRANSCRIPTION_METHOD,
@@ -159,6 +161,37 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_QWEN_ASR_MODEL,
         help='Модель Qwen3-ASR для транскрибации',
     )
+    parser.add_argument(
+        '--qwen-role-validation-model',
+        default=DEFAULT_QWEN_ROLE_VALIDATION_MODEL,
+        help='LLM-модель для валидации ролей К/Т в qwen_asr',
+    )
+    parser.add_argument(
+        '--qwen-role-validation',
+        action='store_true',
+        dest='qwen_role_validation_enabled',
+        default=True,
+        help='Включить LLM-валидацию ролей К/Т в qwen_asr (по умолчанию: включено)',
+    )
+    parser.add_argument(
+        '--no-qwen-role-validation',
+        action='store_false',
+        dest='qwen_role_validation_enabled',
+        help='Отключить LLM-валидацию ролей К/Т в qwen_asr',
+    )
+    parser.add_argument(
+        '--merge-adjacent-roles',
+        action='store_true',
+        dest='merge_adjacent_roles',
+        default=DEFAULT_MERGE_ADJACENT_ROLES,
+        help='Склеивать соседние реплики с одинаковой ролью (по умолчанию: включено)',
+    )
+    parser.add_argument(
+        '--no-merge-adjacent-roles',
+        action='store_false',
+        dest='merge_adjacent_roles',
+        help='Не склеивать соседние реплики с одинаковой ролью',
+    )
     return parser
 
 
@@ -197,5 +230,8 @@ def main() -> None:
         diarization_method=args.diarization_method,
         transcription_method=args.transcription_method,
         qwen_asr_model=args.qwen_asr_model,
+        qwen_role_validation_enabled=args.qwen_role_validation_enabled,
+        qwen_role_validation_model=args.qwen_role_validation_model,
+        merge_adjacent_roles=args.merge_adjacent_roles,
     )
     process_audio_file(args.audio, options)

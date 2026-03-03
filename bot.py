@@ -28,42 +28,17 @@ from psy_protocol.pipeline import ProcessingOptions, process_audio_file
 TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
 SESSION_TTL_SECONDS = 3600  # 1 hour
-WHISPER_LARGE_V3 = "~/.cache/mlx/large-v3"
 
 PRESETS: Dict[str, Dict[str, Any]] = {
-    "large_model": {
-        "label": "🎙 Точнее (large-v3)",
-        "whisper_model": WHISPER_LARGE_V3,
+    "other_approach": {
+        "label": "🎙 Использовать другой подход",
+        "transcription_method": "whisper",
         "force_whisper": True,
-    },
-    "noisy": {
-        "label": "🔇 Плохой звук",
-        "silence_threshold": 0.25,
-        "merge_gap": 0.5,
-        "sandwich_max_duration": 2.0,
-        "word_prob_threshold": 0.15,
-    },
-    "interrupts": {
-        "label": "🗣 Много перебиваний",
-        "merge_gap": 1.0,
-        "sandwich_max_duration": 3.0,
-        "word_prob_threshold": 0.1,
-        "word_smooth_min_words": 3,
-    },
-    "sentences": {
-        "label": "📝 По фразам",
     },
     "swap": {
         "label": "🔄 Поменять К↔Т",
         "speaker_map": "SPEAKER_00=Т,SPEAKER_01=К",
         "force_diarization": False,
-    },
-    "llm_diarize": {
-        "label": "🧠 LLM-диаризация",
-        "diarization_method": "llm",
-        "transcription_method": "whisper",
-        "force_diarization": True,
-        "force_whisper": True,
     },
     "raw_text": {
         "label": "📄 Сырой текст",
@@ -245,18 +220,8 @@ def build_retry_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=PRESETS['large_model']['label'],
-                    callback_data='retry:large_model',
-                ),
-                InlineKeyboardButton(
-                    text=PRESETS['noisy']['label'],
-                    callback_data='retry:noisy',
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=PRESETS['interrupts']['label'],
-                    callback_data='retry:interrupts',
+                    text=PRESETS['other_approach']['label'],
+                    callback_data='retry:other_approach',
                 ),
                 InlineKeyboardButton(
                     text=PRESETS['swap']['label'],
@@ -265,18 +230,8 @@ def build_retry_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text=PRESETS['sentences']['label'],
-                    callback_data='retry:sentences',
-                ),
-                InlineKeyboardButton(
                     text=PRESETS['timed']['label'],
                     callback_data='retry:timed',
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=PRESETS['llm_diarize']['label'],
-                    callback_data='retry:llm_diarize',
                 ),
                 InlineKeyboardButton(
                     text=PRESETS['raw_text']['label'],
@@ -434,9 +389,7 @@ async def run_pipeline_and_send(
         await reply_target.answer_document(FSInputFile(path=str(txt_path)))
         await reply_target.answer_document(FSInputFile(path=str(docx_path)))
         await reply_target.answer(
-            "Если результат неточный — попробуйте один из вариантов:"
-            "- Точнее -- использовать другую модель в 3-5 раз медленее"
-            "- Плохой звук -- изменить параметры ",
+            "Если результат неточный — выберите один из вариантов на кнопках ниже.",
             reply_markup=build_retry_keyboard(),
         )
         return True
@@ -560,10 +513,9 @@ async def handle_retry_callback(
     # Refresh TTL
     session.expires_at = time.monotonic() + SESSION_TTL_SECONDS
 
-    if preset_key in ('sentences', 'raw_text', 'timed'):
+    if preset_key in ('raw_text', 'timed'):
         transcript_dir = Path(session.base_options.transcript_dir) / session.audio_path.stem
         file_map = {
-            'sentences': transcript_dir / 'sentences.txt',
             'raw_text': transcript_dir / 'transcript.txt',
             'timed': transcript_dir / 'timed_dialogue.txt',
         }

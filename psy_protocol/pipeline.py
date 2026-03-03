@@ -9,8 +9,11 @@ from .config import (
     DEFAULT_DIARIZATION_MODEL,
     DEFAULT_EMBEDDING_MIN_DURATION,
     DEFAULT_LLM_DIARIZATION_MODEL,
+    DEFAULT_MERGE_ADJACENT_ROLES,
     DEFAULT_QWEN_ASR_LANGUAGE,
     DEFAULT_QWEN_ASR_MODEL,
+    DEFAULT_QWEN_ROLE_VALIDATION_ENABLED,
+    DEFAULT_QWEN_ROLE_VALIDATION_MODEL,
     DEFAULT_SPEAKER_EMBEDDING_DEVICE,
     DEFAULT_SPEAKER_EMBEDDING_MODEL,
     DEFAULT_TRANSCRIPTION_METHOD,
@@ -29,6 +32,7 @@ from .llm_diarization import diarize_with_llm
 from .docx_writer import create_docx
 from .io_utils import load_json, save_json, save_text
 from .roles import map_speakers_to_roles, parse_speaker_map
+from .replica_postprocess import merge_adjacent_by_role, validate_roles_with_llm
 from .text_outputs import save_dialogue_txt, save_sentences_txt, save_timed_dialogue_txt
 from .text_postprocess import postprocess_replica_text
 from .audio_preprocess import preprocess_audio
@@ -68,6 +72,9 @@ class ProcessingOptions:
     transcription_method: str = DEFAULT_TRANSCRIPTION_METHOD  # 'qwen_asr' | 'whisper'
     qwen_asr_model: str = DEFAULT_QWEN_ASR_MODEL
     qwen_asr_language: str = DEFAULT_QWEN_ASR_LANGUAGE
+    qwen_role_validation_enabled: bool = DEFAULT_QWEN_ROLE_VALIDATION_ENABLED
+    qwen_role_validation_model: str = DEFAULT_QWEN_ROLE_VALIDATION_MODEL
+    merge_adjacent_roles: bool = DEFAULT_MERGE_ADJACENT_ROLES
 
 
 def _serialize_segments(segments: List[SpeakerSegment]) -> list:
@@ -307,8 +314,10 @@ def process_audio_file(
     transcript_json_path = transcript_dir / "transcript.json"
     transcript_txt_path = transcript_dir / "transcript.txt"
 
+    is_qwen_transcription = opts.transcription_method == 'qwen_asr'
+
     # --- QWEN-ASR path: diarize first, then per-segment transcription ---
-    if opts.transcription_method == 'qwen_asr':
+    if is_qwen_transcription:
         force = opts.force_whisper or opts.force_diarization
 
         diarization_segments = _run_diarization(
@@ -436,6 +445,16 @@ def process_audio_file(
     role_map = map_speakers_to_roles(replicas, explicit_map)
     for replica in replicas:
         replica['role'] = role_map.get(replica['speaker'], 'К')
+
+    if is_qwen_transcription:
+        replicas = validate_roles_with_llm(
+            replicas,
+            llm_model_path=opts.qwen_role_validation_model,
+            enabled=opts.qwen_role_validation_enabled,
+        )
+        if opts.merge_adjacent_roles:
+            replicas = merge_adjacent_by_role(replicas)
+            logging.info('Role merge: merged adjacent qwen replicas to %d entries', len(replicas))
 
     metadata = {
         'ФИО': opts.fio,
