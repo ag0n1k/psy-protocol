@@ -61,7 +61,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     "llm_diarize": {
         "label": "🧠 LLM-диаризация",
         "diarization_method": "llm",
+        "transcription_method": "whisper",
         "force_diarization": True,
+        "force_whisper": True,
     },
     "raw_text": {
         "label": "📄 Сырой текст",
@@ -212,7 +214,6 @@ def build_processing_options(
     options = ProcessingOptions(
         output_docx=output_docx,
         transcript_dir=cache_dir,
-        diarization_method='custom_mlx',
     )
     if settings.whisper_model:
         options.whisper_model = settings.whisper_model

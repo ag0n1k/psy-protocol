@@ -140,14 +140,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--diarization-method',
         default=DEFAULT_DIARIZATION_METHOD,
-        choices=['custom_mlx', 'pyannote_pipeline', 'aufklarer_mlx'],
-        help='Метод диаризации (по умолчанию: custom_mlx)',
-    )
-    parser.add_argument(
-        '--clustering-method',
-        default='kmeans',
-        choices=['kmeans', 'spectral', 'agglomerative'],
-        help='Метод кластеризации спикеров',
+        choices=['mlx_segmentation', 'llm'],
+        help='Метод диаризации (по умолчанию: mlx_segmentation)',
     )
     parser.add_argument(
         '--swap',
@@ -201,7 +195,6 @@ def main() -> None:
         force_diarization=args.force_diarization,
         word_timestamps=args.word_timestamps,
         diarization_method=args.diarization_method,
-        clustering_method=args.clustering_method,
         transcription_method=args.transcription_method,
         qwen_asr_model=args.qwen_asr_model,
     )

@@ -340,6 +340,24 @@ def load_aufklarer_model(weights_path: Path) -> PyannoteSegmentationModel:
     return model
 
 
+def _resolve_and_load_model(model_ref: str) -> PyannoteSegmentationModel:
+    """Load PyannoteSegmentationModel from npz or safetensors weights, auto-detecting format."""
+    path = Path(model_ref).expanduser()
+
+    # Try npz first (local path or HuggingFace repo with weights.npz)
+    try:
+        weights_path = resolve_diarization_weights(model_ref)
+        logging.info('Diarization model: loading npz from %s', weights_path)
+        return load_pyannote_model(weights_path)
+    except (FileNotFoundError, RemoteEntryNotFoundError):
+        pass
+
+    # Fall back to safetensors
+    weights_path = resolve_diarization_weights_safetensors(model_ref)
+    logging.info('Diarization model: loading safetensors from %s', weights_path)
+    return load_aufklarer_model(weights_path)
+
+
 def resolve_diarization_weights(model_ref: str) -> Path:
     path = Path(model_ref).expanduser()
     if path.exists():
@@ -494,7 +512,7 @@ def logits_to_segments(
     return segments
 
 
-def diarize_audio_raw(
+def diarize_audio_mlx(
     audio_path: str,
     model_ref: str,
     min_duration: float,
@@ -502,33 +520,7 @@ def diarize_audio_raw(
     overlap: int,
     silence_threshold: float,
 ) -> List[SpeakerSegment]:
-    weights_path = resolve_diarization_weights(model_ref)
-    model = load_pyannote_model(weights_path)
-    waveform, _ = load_audio(audio_path)
-    logits, frame_times = process_audio_chunks(
-        waveform,
-        model,
-        chunk_size=chunk_size,
-        overlap=overlap,
-    )
-    return logits_to_segments(
-        logits,
-        frame_times,
-        min_duration=min_duration,
-        silence_threshold=silence_threshold,
-    )
-
-
-def diarize_audio_raw_aufklarer(
-    audio_path: str,
-    model_ref: str,
-    min_duration: float,
-    chunk_size: int,
-    overlap: int,
-    silence_threshold: float,
-) -> List[SpeakerSegment]:
-    weights_path = resolve_diarization_weights_safetensors(model_ref)
-    model = load_aufklarer_model(weights_path)
+    model = _resolve_and_load_model(model_ref)
     waveform, _ = load_audio(audio_path)
     logits, frame_times = process_audio_chunks(
         waveform,
@@ -690,77 +682,6 @@ def kmeans_cluster(
     return labels
 
 
-def _log_cluster_separation(embeddings: np.ndarray, labels: np.ndarray) -> None:
-    mask0, mask1 = labels == 0, labels == 1
-    if mask0.sum() > 1 and mask1.sum() > 1:
-        within = (
-            (embeddings[mask0] @ embeddings[mask0].T).mean()
-            + (embeddings[mask1] @ embeddings[mask1].T).mean()
-        ) / 2
-        between = (embeddings[mask0] @ embeddings[mask1].T).mean()
-        logging.info(
-            'Cluster sep: within=%.3f between=%.3f delta=%.3f',
-            within,
-            between,
-            within - between,
-        )
-
-
-def spectral_cluster_2(embeddings: np.ndarray) -> np.ndarray:
-    """Spectral clustering for k=2 using eigenvector k-means on 2D spectral embedding."""
-    n = embeddings.shape[0]
-    if n <= 2:
-        return np.arange(n, dtype=int)
-
-    # Cosine affinity: for normalized embeddings = dot product
-    W = embeddings @ embeddings.T        # [-1, 1]
-    W = (W + 1.0) / 2.0                 # → [0, 1]
-    np.fill_diagonal(W, 0.0)
-
-    # Normalized Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
-    d = W.sum(axis=1)
-    d_inv_sqrt = np.where(d > 1e-10, 1.0 / np.sqrt(d), 0.0)
-    L_sym = np.eye(n) - d_inv_sqrt[:, None] * W * d_inv_sqrt[None, :]
-
-    _, vecs = np.linalg.eigh(L_sym)
-    # Take 2 smallest eigenvectors (sklearn standard for spectral clustering)
-    spectral_embedding = vecs[:, :2]
-    # Row-normalize (sklearn standard)
-    norms = np.linalg.norm(spectral_embedding, axis=1, keepdims=True)
-    spectral_embedding = spectral_embedding / np.where(norms > 1e-10, norms, 1.0)
-
-    # K-means on 2D spectral embedding — more robust than gap-based threshold
-    labels = kmeans_cluster(spectral_embedding, k=2)
-
-    fiedler = vecs[:, 1]
-    sorted_vals = np.sort(fiedler)
-    gaps = np.diff(sorted_vals)
-    logging.info(
-        'Spectral: max_gap=%.4f, cluster_sizes=%s',
-        gaps.max(),
-        str(np.bincount(labels).tolist()),
-    )
-    _log_cluster_separation(embeddings, labels)
-    return labels
-
-
-def agglomerative_cluster_2(embeddings: np.ndarray) -> np.ndarray:
-    """Agglomerative clustering with average linkage and cosine distance for k=2."""
-    from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import pdist
-
-    n = embeddings.shape[0]
-    if n <= 2:
-        return np.arange(n, dtype=int)
-
-    dist = pdist(embeddings, metric='cosine')
-    Z = linkage(dist, method='average')
-    labels = fcluster(Z, t=2, criterion='maxclust') - 1  # fcluster starts from 1
-    logging.info('Agglomerative: cluster_sizes=%s', str(np.bincount(labels).tolist()))
-    _log_cluster_separation(embeddings, labels)
-    return labels
-
-
 def remap_labels_by_first_occurrence(labels: np.ndarray) -> np.ndarray:
     mapping: Dict[int, int] = {}
     next_id = 0
@@ -805,7 +726,6 @@ def cluster_segments_by_embeddings(
     num_speakers: int,
     embedding_model_id: str,
     embedding_device: str,
-    clustering_method: str = 'kmeans',
 ) -> List[SpeakerSegment]:
     if not segments:
         return []
@@ -861,15 +781,8 @@ def cluster_segments_by_embeddings(
     embeddings_np = np.vstack(embeddings)
     k = num_speakers if num_speakers and num_speakers > 0 else 1
     k = min(k, embeddings_np.shape[0])
-    if k == 2 and clustering_method == 'spectral':
-        logging.info('Clustering: using spectral (eigvec k-means, k=2)')
-        labels = spectral_cluster_2(embeddings_np)
-    elif k == 2 and clustering_method == 'agglomerative':
-        logging.info('Clustering: using agglomerative (average cosine, k=2)')
-        labels = agglomerative_cluster_2(embeddings_np)
-    else:
-        logging.info('Clustering: using k-means (k=%d)', k)
-        labels = kmeans_cluster(embeddings_np, k)
+    logging.info('Clustering: using k-means (k=%d)', k)
+    labels = kmeans_cluster(embeddings_np, k)
     labels = remap_labels_by_first_occurrence(labels)
 
     full_labels = assign_missing_labels_by_nearest(segments, indices, labels)
@@ -927,51 +840,6 @@ def merge_sandwiched_segments(
             merged.append(segments[i])
             i += 1
         segments = merged
-    return segments
-
-
-def diarize_with_pyannote_pipeline(
-    audio_path: str,
-    num_speakers: int = 2,
-    pipeline_model: str = 'pyannote/speaker-diarization-3.1',
-    hf_token: Optional[str] = None,
-) -> List[SpeakerSegment]:
-    from pyannote.audio import Pipeline
-
-    logging.info('Pyannote pipeline: loading %s', pipeline_model)
-    pipeline = Pipeline.from_pretrained(pipeline_model)
-    pipeline.to(torch.device("mps"))
-
-    # Load via torchaudio to avoid sample-count mismatch with compressed formats (ogg, mp3).
-    # Pyannote reads duration from metadata and expects an exact sample count; decoding
-    # compressed audio often yields slightly fewer samples, causing a ValueError.
-    waveform, sr = torchaudio.load(audio_path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != 16000:
-        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
-        sr = 16000
-
-    logging.info('Pyannote pipeline: running diarization')
-    diarization = pipeline({'waveform': waveform, 'sample_rate': sr}, num_speakers=num_speakers)
-
-    # pyannote 4.x returns DiarizeOutput; older versions return Annotation directly
-    annotation = getattr(diarization, 'speaker_diarization', diarization)
-
-    segments = []
-    for turn, _, speaker in annotation.itertracks(yield_label=True):
-        segments.append(SpeakerSegment(start=turn.start, end=turn.end, speaker=speaker))
-
-    if segments:
-        label_map = {}
-        next_id = 0
-        for seg in segments:
-            if seg.speaker not in label_map:
-                label_map[seg.speaker] = f'SPEAKER_{next_id:02d}'
-                next_id += 1
-        segments = [SpeakerSegment(s.start, s.end, label_map[s.speaker]) for s in segments]
-
-    logging.info('Pyannote pipeline: %d segments', len(segments))
     return segments
 
 
