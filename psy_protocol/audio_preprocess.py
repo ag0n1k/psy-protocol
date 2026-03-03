@@ -1,14 +1,29 @@
 import logging
+import os
 import shutil
 import subprocess
 
 
 def _ffmpeg_bin() -> str:
     path = shutil.which('ffmpeg')
-    if path is None:
+    if path and os.path.exists(path):
+        return path
+
+    candidates = [
         # common Homebrew location on macOS Apple Silicon
-        path = '/opt/homebrew/bin/ffmpeg'
-    return path
+        '/opt/homebrew/bin/ffmpeg',
+
+        # common Homebrew location on macOS Intel
+        '/usr/local/bin/ffmpeg',
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        'ffmpeg binary not found. Install ffmpeg and ensure it is available in PATH '
+        '(e.g. `brew install ffmpeg`).'
+    )
 
 
 def preprocess_audio(input_path: str, output_path: str) -> None:
