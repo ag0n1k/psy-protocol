@@ -33,7 +33,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     "other_approach": {
         "label": "🎙 Использовать другой подход",
         "transcription_method": "whisper",
-        "force_whisper": True,
     },
     "swap": {
         "label": "🔄 Поменять К↔Т",
@@ -79,6 +78,7 @@ class JobSession:
 
 # Keyed by chat_id (int)
 job_sessions: Dict[int, "JobSession"] = {}
+PIPELINE_SEMAPHORE = asyncio.Semaphore(1)
 
 CONSENTS_FILE = Path("consents/accepted.txt")
 consented_users: set[int] = set()
@@ -301,6 +301,7 @@ def build_bar(percent: float) -> str:
 
 def stage_label(stage: str) -> str:
     labels = {
+        "queue": "Ожидание очереди",
         "start": "Старт",
         "prepare": "Подготовка",
         "whisper": "Распознавание (Whisper)",
@@ -314,6 +315,7 @@ def stage_label(stage: str) -> str:
 
 def stage_hint(stage: str) -> str:
     hints = {
+        "queue": "Жду завершения предыдущей обработки.",
         "start": "Запускаю обработку.",
         "prepare": "Подготавливаю файлы и кэш.",
         "whisper": "Распознаю речь (Whisper).",
@@ -380,9 +382,13 @@ async def run_pipeline_and_send(
         progress_updater(status_message, progress, interval_seconds=5)
     )
     try:
-        docx_path, txt_path = await asyncio.to_thread(
-            process_audio_file, audio_path, opts, lambda s, p, m: _update_progress(progress, s, p, m, chat_id)
-        )
+        if PIPELINE_SEMAPHORE.locked():
+            _update_progress(progress, "queue", 0.0, "Waiting in processing queue", chat_id)
+
+        async with PIPELINE_SEMAPHORE:
+            docx_path, txt_path = await asyncio.to_thread(
+                process_audio_file, audio_path, opts, lambda s, p, m: _update_progress(progress, s, p, m, chat_id)
+            )
         progress["done"] = True
         progress["success"] = True
         await updater_task
@@ -508,6 +514,12 @@ async def handle_retry_callback(
     if not session or time.monotonic() > session.expires_at:
         if callback.message:
             await callback.message.answer("Сессия истекла, отправьте аудио заново.")
+        return
+    if not session.audio_path.exists():
+        if callback.message:
+            await callback.message.answer('Исходный аудиофайл недоступен, отправьте аудио заново.')
+        cleanup_work_dir(session.work_dir)
+        job_sessions.pop(chat_id, None)
         return
 
     # Refresh TTL

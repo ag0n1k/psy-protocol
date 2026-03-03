@@ -363,10 +363,14 @@ def process_audio_file(
         use_word_timestamps = opts.word_timestamps
 
         cache_valid = transcript_json_path.exists() and not opts.force_whisper
-        if cache_valid and transcript_meta_path.exists():
-            cached_meta = load_json(transcript_meta_path)
-            if cached_meta.get('transcription_method') != opts.transcription_method:
-                logging.info('Transcription method changed, invalidating cache')
+        if cache_valid:
+            if transcript_meta_path.exists():
+                cached_meta = load_json(transcript_meta_path)
+                if cached_meta.get('transcription_method') != opts.transcription_method:
+                    logging.info('Transcription method changed, invalidating cache')
+                    cache_valid = False
+            else:
+                logging.info('Transcription meta missing, invalidating cache')
                 cache_valid = False
 
         if cache_valid:
