@@ -12,6 +12,7 @@ from psy_protocol import ProcessingOptions, process_audio_file
 DEFAULT_TESTS_DIR = Path(__file__).parent / 'tests'
 TEST_NUMBERS = list(range(1, 6))
 TRANSCRIPTION_METHODS = ['whisper', 'qwen_asr']
+DIARIZATION_METHODS = ['mlx_segmentation', 'llm']
 
 CONFIGS = {
     'default': ProcessingOptions(),
@@ -29,9 +30,6 @@ CONFIGS = {
         min_segment_duration=0.3,
     ),
 }
-
-CLUSTERING_METHODS = ['kmeans', 'spectral', 'agglomerative']
-DIARIZATION_METHODS = ['pyannote_pipeline', 'custom_mlx', 'aufklarer_mlx', 'llm']
 
 
 def parse_dialogue(path: Path) -> List[Tuple[str, str]]:
@@ -326,14 +324,9 @@ def main() -> None:
         help='Skip pipeline, recompute metrics from existing output files',
     )
     parser.add_argument(
-        '--compare-clustering',
-        action='store_true',
-        help='Run all clustering methods and compare Speaker%% results',
-    )
-    parser.add_argument(
         '--compare-diarization',
         action='store_true',
-        help='Compare pyannote_pipeline vs custom_mlx diarization methods (Speaker%%)',
+        help='Compare mlx_segmentation vs llm diarization methods (Speaker%%)',
     )
     parser.add_argument(
         '--diarization-method',
@@ -396,10 +389,11 @@ def main() -> None:
         methods = args.diarization_method or DIARIZATION_METHODS
         transcription_method = (args.transcription_method or [None])[0]
         for i, method in enumerate(methods):
-            extra = {}
-            if transcription_method:
-                extra['transcription_method'] = transcription_method
-                # first diarization method runs transcription; rest reuse cache
+            # llm diarization always requires whisper transcription
+            effective_transcription = 'whisper' if method == 'llm' else transcription_method
+            extra: dict = {}
+            if effective_transcription:
+                extra['transcription_method'] = effective_transcription
                 extra['force_whisper'] = (i == 0)
             options = dataclasses.replace(
                 ProcessingOptions(),
@@ -407,7 +401,7 @@ def main() -> None:
                 force_diarization=True,
                 **extra,
             )
-            suffix = f'_{transcription_method}' if transcription_method else ''
+            suffix = f'_{effective_transcription}' if effective_transcription else ''
             config_key = f'diarization:{method}'
             config_dir = f'diarization_{method}{suffix}'
             results = []
@@ -418,28 +412,6 @@ def main() -> None:
                     print(f'ERROR: {result["error"]}')
                 else:
                     print(f'OK  overall={result["overall"]:.1f}%  {format_duration(result["duration"])}')
-                results.append(result)
-            all_results[config_key] = results
-
-        _print_clustering_comparison(all_results)
-        return
-
-    if args.compare_clustering:
-        all_results: Dict[str, List[Dict]] = {}
-        for method in CLUSTERING_METHODS:
-            options = dataclasses.replace(
-                ProcessingOptions(), clustering_method=method, force_diarization=True,
-            )
-            config_key = f'clustering:{method}'
-            config_dir = f'clustering_{method}'
-            results = []
-            for test_num in test_nums:
-                print(f'[{method}] test {test_num}...', end=' ', flush=True)
-                result = run_test(test_num, config_dir, options, args.no_process, tests_dir)
-                if 'error' in result:
-                    print(f'ERROR: {result["error"]}')
-                else:
-                    print(f'OK  speaker={result["speaker"]:.1f}%')
                 results.append(result)
             all_results[config_key] = results
 
