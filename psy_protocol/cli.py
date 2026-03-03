@@ -4,8 +4,10 @@ import logging
 from .config import (
     DEFAULT_DIARIZATION_METHOD,
     DEFAULT_DIARIZATION_MODEL,
+    DEFAULT_QWEN_ASR_MODEL,
     DEFAULT_SPEAKER_EMBEDDING_DEVICE,
     DEFAULT_SPEAKER_EMBEDDING_MODEL,
+    DEFAULT_TRANSCRIPTION_METHOD,
     DEFAULT_WHISPER_MODEL,
     DEFAULT_WORD_PROB_THRESHOLD,
     DEFAULT_WORD_SMOOTH_MIN_WORDS,
@@ -152,6 +154,17 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Поменять К↔Т (shortcut для --speaker-map SPEAKER_00=Т,SPEAKER_01=К)',
     )
+    parser.add_argument(
+        '--transcription-method',
+        default=DEFAULT_TRANSCRIPTION_METHOD,
+        choices=['whisper', 'qwen_asr'],
+        help='Метод транскрибации (по умолчанию: whisper)',
+    )
+    parser.add_argument(
+        '--qwen-asr-model',
+        default=DEFAULT_QWEN_ASR_MODEL,
+        help='Модель Qwen3-ASR для транскрибации',
+    )
     return parser
 
 
@@ -189,5 +202,7 @@ def main() -> None:
         word_timestamps=args.word_timestamps,
         diarization_method=args.diarization_method,
         clustering_method=args.clustering_method,
+        transcription_method=args.transcription_method,
+        qwen_asr_model=args.qwen_asr_model,
     )
     process_audio_file(args.audio, options)

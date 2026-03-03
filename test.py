@@ -9,9 +9,9 @@ from typing import Dict, List, Optional, Tuple
 
 from psy_protocol import ProcessingOptions, process_audio_file
 
-TESTS_DIR = Path(__file__).parent / 'tests'
-OUTPUT_DIR = TESTS_DIR / 'output'
+DEFAULT_TESTS_DIR = Path(__file__).parent / 'tests'
 TEST_NUMBERS = list(range(1, 6))
+TRANSCRIPTION_METHODS = ['whisper', 'qwen_asr']
 
 CONFIGS = {
     'default': ProcessingOptions(),
@@ -91,15 +91,27 @@ def speaker_accuracy(
     return best_score * 100, best_swap
 
 
+def find_audio(tests_dir: Path, test_num: int) -> Optional[Path]:
+    for ext in ('.wav', '.ogg', '.mp3', '.m4a', '.flac'):
+        p = tests_dir / f'{test_num}{ext}'
+        if p.exists():
+            return p
+    return None
+
+
 def run_test(
     test_num: int,
     config_name: str,
     options: ProcessingOptions,
     no_process: bool,
+    tests_dir: Optional[Path] = None,
 ) -> Dict:
-    audio_path = TESTS_DIR / f'{test_num}.ogg'
-    goal_path = TESTS_DIR / f'{test_num}_goal.txt'
-    output_dir = OUTPUT_DIR / config_name
+    tests_dir = tests_dir or DEFAULT_TESTS_DIR
+    output_dir = tests_dir / 'output' / config_name
+    audio_path = find_audio(tests_dir, test_num)
+    if audio_path is None:
+        return {'test': test_num, 'error': 'audio not found', 'duration': None}
+    goal_path = tests_dir / f'{test_num}_goal.txt'
     output_dir.mkdir(parents=True, exist_ok=True)
     output_docx = output_dir / f'{test_num}.docx'
     output_txt = output_dir / f'{test_num}.txt'
@@ -109,8 +121,7 @@ def run_test(
         opts = dataclasses.replace(
             options,
             output_docx=output_docx,
-            transcript_dir=Path(__file__).parent / 'transcripts',
-            force_diarization=True,
+            transcript_dir=tests_dir / 'transcripts',
         )
         t0 = time.time()
         process_audio_file(audio_path, opts)
@@ -209,7 +220,57 @@ def print_comparison(all_results: Dict[str, List[Dict]]) -> None:
 
 def _print_clustering_comparison(all_results: Dict[str, List[Dict]]) -> None:
     method_keys = list(all_results.keys())
-    print('\n=== Clustering method comparison (Speaker%) ===\n')
+    col_w = 14
+
+    for metric, label in (('speaker', 'Speaker%'), ('overall', 'Overall%')):
+        print(f'\n=== Diarization comparison ({label}) ===\n')
+        header = f'{"Test":>4}' + ''.join(f'  {k.split(":")[-1]:>{col_w}}' for k in method_keys)
+        separator = '-' * len(header)
+        print(header)
+        print(separator)
+
+        test_nums = sorted({r['test'] for results in all_results.values() for r in results})
+        avgs: Dict[str, List[float]] = {k: [] for k in method_keys}
+
+        for test_num in test_nums:
+            row = f'{test_num:>4}'
+            for key in method_keys:
+                r = next((x for x in all_results[key] if x['test'] == test_num), None)
+                if r is None or 'error' in r:
+                    row += f'  {"—":>{col_w}}'
+                else:
+                    avgs[key].append(r[metric])
+                    row += f'  {r[metric]:>{col_w}.1f}'
+            print(row)
+
+        avg_row = f'{"AVG":>4}'
+        for key in method_keys:
+            vals = avgs[key]
+            avg_row += f'  {sum(vals)/len(vals):>{col_w}.1f}' if vals else f'  {"—":>{col_w}}'
+        print(separator)
+        print(avg_row)
+
+    print('\n=== Diarization comparison (Duration) ===\n')
+    header = f'{"Test":>4}' + ''.join(f'  {k.split(":")[-1]:>{col_w}}' for k in method_keys)
+    separator = '-' * len(header)
+    print(header)
+    print(separator)
+    test_nums = sorted({r['test'] for results in all_results.values() for r in results})
+    for test_num in test_nums:
+        row = f'{test_num:>4}'
+        for key in method_keys:
+            r = next((x for x in all_results[key] if x['test'] == test_num), None)
+            if r is None or 'error' in r:
+                row += f'  {"—":>{col_w}}'
+            else:
+                row += f'  {format_duration(r["duration"]):>{col_w}}'
+        print(row)
+    print(separator)
+
+
+def _print_transcription_comparison(all_results: Dict[str, List[Dict]]) -> None:
+    method_keys = list(all_results.keys())
+    print('\n=== Transcription method comparison (Text%) ===\n')
 
     header = f'{"Test":>4}' + ''.join(f'  {k.split(":")[-1]:>12}' for k in method_keys)
     separator = '-' * len(header)
@@ -226,8 +287,8 @@ def _print_clustering_comparison(all_results: Dict[str, List[Dict]]) -> None:
             if r is None or 'error' in r:
                 row += f'  {"—":>12}'
             else:
-                avgs[key].append(r['speaker'])
-                row += f'  {r["speaker"]:>12.1f}'
+                avgs[key].append(r['text'])
+                row += f'  {r["text"]:>12.1f}'
         print(row)
 
     avg_row = f'{"AVG":>4}'
@@ -281,28 +342,82 @@ def main() -> None:
         metavar='METHOD',
         help='Run only specific diarization methods (e.g. --diarization-method llm)',
     )
+    parser.add_argument(
+        '--compare-transcription',
+        action='store_true',
+        help='Compare whisper vs qwen_asr transcription methods (Text%%)',
+    )
+    parser.add_argument(
+        '--transcription-method',
+        nargs='+',
+        choices=TRANSCRIPTION_METHODS,
+        metavar='METHOD',
+        help='Run only specific transcription methods (e.g. --transcription-method qwen_asr)',
+    )
+    parser.add_argument(
+        '--tests-dir',
+        default=None,
+        help='Path to directory with test audio and goal files',
+    )
     args = parser.parse_args()
 
+    tests_dir = Path(args.tests_dir).expanduser() if args.tests_dir else DEFAULT_TESTS_DIR
     test_nums = args.test or TEST_NUMBERS
+
+    if args.compare_transcription:
+        all_results: Dict[str, List[Dict]] = {}
+        methods = args.transcription_method or TRANSCRIPTION_METHODS
+        for i, method in enumerate(methods):
+            options = dataclasses.replace(
+                ProcessingOptions(),
+                transcription_method=method,
+                force_whisper=True,
+                # diarization cache is reused across transcription methods
+                force_diarization=(i == 0),
+            )
+            config_key = f'transcription:{method}'
+            config_dir = f'transcription_{method}'
+            results = []
+            for test_num in test_nums:
+                print(f'[{method}] test {test_num}...', end=' ', flush=True)
+                result = run_test(test_num, config_dir, options, args.no_process, tests_dir)
+                if 'error' in result:
+                    print(f'ERROR: {result["error"]}')
+                else:
+                    print(f'OK  text={result["text"]:.1f}%')
+                results.append(result)
+            all_results[config_key] = results
+
+        _print_transcription_comparison(all_results)
+        return
 
     if args.compare_diarization:
         all_results: Dict[str, List[Dict]] = {}
         methods = args.diarization_method or DIARIZATION_METHODS
-        for method in methods:
+        transcription_method = (args.transcription_method or [None])[0]
+        for i, method in enumerate(methods):
+            extra = {}
+            if transcription_method:
+                extra['transcription_method'] = transcription_method
+                # first diarization method runs transcription; rest reuse cache
+                extra['force_whisper'] = (i == 0)
             options = dataclasses.replace(
                 ProcessingOptions(),
                 diarization_method=method,
+                force_diarization=True,
+                **extra,
             )
+            suffix = f'_{transcription_method}' if transcription_method else ''
             config_key = f'diarization:{method}'
-            config_dir = f'diarization_{method}'
+            config_dir = f'diarization_{method}{suffix}'
             results = []
             for test_num in test_nums:
                 print(f'[{method}] test {test_num}...', end=' ', flush=True)
-                result = run_test(test_num, config_dir, options, args.no_process)
+                result = run_test(test_num, config_dir, options, args.no_process, tests_dir)
                 if 'error' in result:
                     print(f'ERROR: {result["error"]}')
                 else:
-                    print(f'OK  speaker={result["speaker"]:.1f}%')
+                    print(f'OK  overall={result["overall"]:.1f}%  {format_duration(result["duration"])}')
                 results.append(result)
             all_results[config_key] = results
 
@@ -312,13 +427,15 @@ def main() -> None:
     if args.compare_clustering:
         all_results: Dict[str, List[Dict]] = {}
         for method in CLUSTERING_METHODS:
-            options = dataclasses.replace(ProcessingOptions(), clustering_method=method)
+            options = dataclasses.replace(
+                ProcessingOptions(), clustering_method=method, force_diarization=True,
+            )
             config_key = f'clustering:{method}'
             config_dir = f'clustering_{method}'
             results = []
             for test_num in test_nums:
                 print(f'[{method}] test {test_num}...', end=' ', flush=True)
-                result = run_test(test_num, config_dir, options, args.no_process)
+                result = run_test(test_num, config_dir, options, args.no_process, tests_dir)
                 if 'error' in result:
                     print(f'ERROR: {result["error"]}')
                 else:
@@ -337,7 +454,7 @@ def main() -> None:
         results = []
         for test_num in test_nums:
             print(f'[{config_name}] test {test_num}...', end=' ', flush=True)
-            result = run_test(test_num, config_name, options, args.no_process)
+            result = run_test(test_num, config_name, options, args.no_process, tests_dir)
             if 'error' in result:
                 print(f'ERROR: {result["error"]}')
             else:

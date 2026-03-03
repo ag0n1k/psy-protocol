@@ -11,8 +11,10 @@ from .config import (
     DEFAULT_EMBEDDING_MIN_DURATION,
     DEFAULT_LLM_DIARIZATION_MODEL,
     DEFAULT_PYANNOTE_PIPELINE_MODEL,
+    DEFAULT_QWEN_ASR_MODEL,
     DEFAULT_SPEAKER_EMBEDDING_DEVICE,
     DEFAULT_SPEAKER_EMBEDDING_MODEL,
+    DEFAULT_TRANSCRIPTION_METHOD,
     DEFAULT_WHISPER_MODEL,
     DEFAULT_WORD_PROB_THRESHOLD,
     DEFAULT_WORD_SMOOTH_MIN_WORDS,
@@ -32,6 +34,7 @@ from .io_utils import load_json, save_json, save_text
 from .roles import map_speakers_to_roles, parse_speaker_map
 from .text_outputs import save_dialogue_txt, save_sentences_txt, save_timed_dialogue_txt
 from .text_postprocess import postprocess_replica_text
+from .qwen_transcribe import transcribe_audio_qwen
 from .whisper_transcribe import extract_words, transcribe_audio
 
 
@@ -66,6 +69,8 @@ class ProcessingOptions:
     pyannote_pipeline_model: str = DEFAULT_PYANNOTE_PIPELINE_MODEL
     aufklarer_mlx_model: str = DEFAULT_AUFKLARER_MLX_MODEL
     llm_diarization_model: str = DEFAULT_LLM_DIARIZATION_MODEL
+    transcription_method: str = DEFAULT_TRANSCRIPTION_METHOD
+    qwen_asr_model: str = DEFAULT_QWEN_ASR_MODEL
     hf_token: Optional[str] = None
 
 
@@ -89,7 +94,11 @@ def process_audio_file(
     emit("start", 0.0, "Starting processing")
     logging.info("Processing started")
     logging.info("Audio: %s", audio_path)
-    logging.info("Whisper model: %s", opts.whisper_model)
+    logging.info("Transcription method: %s", opts.transcription_method)
+    if opts.transcription_method == 'qwen_asr':
+        logging.info("Qwen ASR model: %s", opts.qwen_asr_model)
+    else:
+        logging.info("Whisper model: %s", opts.whisper_model)
     logging.info("Diarization model: %s", opts.diarization_model)
     logging.info(
         "Diarization params: min_duration=%.2f, silence_threshold=%.2f, chunk=%d, overlap=%d",
@@ -121,28 +130,49 @@ def process_audio_file(
     transcript_json_path = transcript_dir / "transcript.json"
     transcript_txt_path = transcript_dir / "transcript.txt"
     whisper_segments_path = transcript_dir / "whisper_segments.json"
+    transcript_meta_path = transcript_dir / "transcript_meta.json"
 
-    if transcript_json_path.exists() and not opts.force_whisper:
-        logging.info("Whisper: loading from cache %s", transcript_json_path)
+    use_word_timestamps = opts.word_timestamps and opts.transcription_method != 'qwen_asr'
+
+    cache_valid = transcript_json_path.exists() and not opts.force_whisper
+    if cache_valid and transcript_meta_path.exists():
+        cached_meta = load_json(transcript_meta_path)
+        if cached_meta.get('transcription_method') != opts.transcription_method:
+            logging.info('Transcription method changed, invalidating cache')
+            cache_valid = False
+
+    if cache_valid:
+        logging.info("Transcription: loading from cache %s", transcript_json_path)
         whisper_result = load_json(transcript_json_path)
-        emit("whisper", 80.0, "Whisper transcript loaded from cache")
+        emit("whisper", 80.0, "Transcript loaded from cache")
     else:
-        emit("whisper", 5.0, "Whisper transcription started")
+        emit("whisper", 5.0, "Transcription started")
 
-        def whisper_progress(percent: float) -> None:
+        def transcription_progress(percent: float) -> None:
             mapped = 5.0 + (75.0 * (percent / 100.0))
-            emit("whisper", mapped, f"Whisper transcription {int(percent)}%")
+            emit("whisper", mapped, f"Transcription {int(percent)}%")
 
-        logging.info("Whisper: starting transcription (word_timestamps=%s)", opts.word_timestamps)
-        whisper_result = transcribe_audio(
-            str(audio_path),
-            opts.whisper_model,
-            word_timestamps=opts.word_timestamps,
-            progress_callback=whisper_progress,
-        )
+        if opts.transcription_method == 'qwen_asr':
+            logging.info("Qwen ASR: starting transcription")
+            whisper_result = transcribe_audio_qwen(
+                str(audio_path),
+                opts.qwen_asr_model,
+                progress_callback=transcription_progress,
+            )
+        else:
+            logging.info(
+                "Whisper: starting transcription (word_timestamps=%s)", use_word_timestamps,
+            )
+            whisper_result = transcribe_audio(
+                str(audio_path),
+                opts.whisper_model,
+                word_timestamps=use_word_timestamps,
+                progress_callback=transcription_progress,
+            )
         save_json(transcript_json_path, whisper_result)
-        logging.info("Whisper: cache saved %s", transcript_json_path)
-        emit("whisper", 80.0, "Whisper transcription completed")
+        save_json(transcript_meta_path, {'transcription_method': opts.transcription_method})
+        logging.info("Transcription: cache saved %s", transcript_json_path)
+        emit("whisper", 80.0, "Transcription completed")
 
     if opts.force_whisper or not transcript_txt_path.exists():
         save_text(transcript_txt_path, whisper_result.get("text", ""))
@@ -383,10 +413,10 @@ def process_audio_file(
 
     words = (
         extract_words(whisper_result, prob_threshold=opts.word_prob_threshold)
-        if opts.word_timestamps
+        if use_word_timestamps
         else []
     )
-    if opts.word_timestamps and words:
+    if use_word_timestamps and words:
         logging.info("Whisper: word timestamps %d", len(words))
         replicas = build_replicas_from_words(
             words,
@@ -394,8 +424,8 @@ def process_audio_file(
             smooth_min_words=opts.word_smooth_min_words,
         )
     else:
-        if opts.word_timestamps:
-            logging.warning("Whisper: no word timestamps, falling back to segments")
+        if use_word_timestamps:
+            logging.warning("No word timestamps available, falling back to segments")
         replicas = build_replicas(whisper_segments, diarization_segments)
 
     for replica in replicas:

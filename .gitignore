@@ -1,6 +1,7 @@
 # Local environment and IDE
 .env
 .idea/
+logs/*.log
 
 # Python cache
 __pycache__/

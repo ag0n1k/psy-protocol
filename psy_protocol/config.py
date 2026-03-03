@@ -1,6 +1,8 @@
 DEFAULT_WHISPER_MODEL = "~/.cache/mlx/large-v3-turbo"
+DEFAULT_QWEN_ASR_MODEL = 'mlx-community/Qwen3-ASR-1.7B-8bit'
+DEFAULT_TRANSCRIPTION_METHOD = 'qwen_asr'
 DEFAULT_DIARIZATION_MODEL = "mlx-community/pyannote-segmentation-3.0-mlx"
-DEFAULT_DIARIZATION_METHOD = 'pyannote_pipeline'
+DEFAULT_DIARIZATION_METHOD = 'custom_mlx'
 DEFAULT_PYANNOTE_PIPELINE_MODEL = 'pyannote/speaker-diarization-3.1'
 DEFAULT_AUFKLARER_MLX_MODEL = 'aufklarer/Pyannote-Segmentation-MLX'
 DEFAULT_LLM_DIARIZATION_MODEL = 'mlx-community/Qwen2.5-14B-Instruct-4bit'

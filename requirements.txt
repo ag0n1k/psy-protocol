@@ -1,4 +1,5 @@
 mlx-whisper
+mlx-audio
 mlx
 mlx-lm
 numpy
