@@ -8,12 +8,9 @@ from .config import (
     DEFAULT_DIARIZATION_METHOD,
     DEFAULT_DIARIZATION_MODEL,
     DEFAULT_EMBEDDING_MIN_DURATION,
-    DEFAULT_LLM_DIARIZATION_MODEL,
     DEFAULT_MERGE_ADJACENT_ROLES,
     DEFAULT_QWEN_ASR_LANGUAGE,
     DEFAULT_QWEN_ASR_MODEL,
-    DEFAULT_QWEN_ROLE_VALIDATION_ENABLED,
-    DEFAULT_QWEN_ROLE_VALIDATION_MODEL,
     DEFAULT_SPEAKER_EMBEDDING_DEVICE,
     DEFAULT_SPEAKER_EMBEDDING_MODEL,
     DEFAULT_TRANSCRIPTION_METHOD,
@@ -28,11 +25,10 @@ from .diarization import (
     load_audio,
     post_process_diarization,
 )
-from .llm_diarization import diarize_with_llm
 from .docx_writer import create_docx
 from .io_utils import load_json, save_json, save_text
 from .roles import map_speakers_to_roles, parse_speaker_map
-from .replica_postprocess import merge_adjacent_by_role, validate_roles_with_llm
+from .replica_postprocess import merge_adjacent_by_role
 from .text_outputs import save_dialogue_txt, save_sentences_txt, save_timed_dialogue_txt
 from .text_postprocess import postprocess_replica_text
 from .audio_preprocess import preprocess_audio
@@ -67,13 +63,10 @@ class ProcessingOptions:
     force_diarization: bool = False
     preprocess_audio: bool = True
     word_timestamps: bool = True
-    diarization_method: str = DEFAULT_DIARIZATION_METHOD  # 'mlx_segmentation' | 'llm'
-    llm_diarization_model: str = DEFAULT_LLM_DIARIZATION_MODEL
+    diarization_method: str = DEFAULT_DIARIZATION_METHOD
     transcription_method: str = DEFAULT_TRANSCRIPTION_METHOD  # 'qwen_asr' | 'whisper'
     qwen_asr_model: str = DEFAULT_QWEN_ASR_MODEL
     qwen_asr_language: str = DEFAULT_QWEN_ASR_LANGUAGE
-    qwen_role_validation_enabled: bool = DEFAULT_QWEN_ROLE_VALIDATION_ENABLED
-    qwen_role_validation_model: str = DEFAULT_QWEN_ROLE_VALIDATION_MODEL
     merge_adjacent_roles: bool = DEFAULT_MERGE_ADJACENT_ROLES
 
 
@@ -98,42 +91,13 @@ def _is_diarization_cache_valid(payload: dict, opts: 'ProcessingOptions') -> boo
         return False
     if params.get('sandwich_max_duration') != opts.sandwich_max_duration:
         return False
-    if opts.diarization_method == 'mlx_segmentation':
-        return (
-            payload.get('method') == 'embedding_clustering_v4'
-            and params.get('silence_threshold') == opts.silence_threshold
-            and params.get('min_segment_duration') == opts.min_segment_duration
-            and params.get('embedding_model') == opts.speaker_embedding_model
-            and params.get('embedding_device') == opts.speaker_embedding_device
-        )
-    if opts.diarization_method == 'llm':
-        return params.get('llm_model') == opts.llm_diarization_model
-    return False
-
-
-def _run_llm_diarization(
-    opts: 'ProcessingOptions',
-    whisper_segments: list,
-    save_path: Path,
-    emit: Callable,
-) -> List[SpeakerSegment]:
-    emit('diarization', 86.0, 'Running LLM diarization')
-    segments = diarize_with_llm(whisper_segments, model_path=opts.llm_diarization_model)
-    logging.info('Diarization: LLM segments %d', len(segments))
-    save_json(save_path, {
-        'method': 'llm_v1',
-        'segments': _serialize_segments(segments),
-        'params': {
-            'diarization_method': 'llm',
-            'num_speakers': opts.max_speakers,
-            'merge_gap': opts.merge_gap,
-            'sandwich_max_duration': opts.sandwich_max_duration,
-            'llm_model': opts.llm_diarization_model,
-        },
-    })
-    logging.info('Diarization: LLM results saved %s', save_path)
-    emit('diarization', 92.0, 'LLM diarization completed')
-    return segments
+    return (
+        payload.get('method') == 'embedding_clustering_v4'
+        and params.get('silence_threshold') == opts.silence_threshold
+        and params.get('min_segment_duration') == opts.min_segment_duration
+        and params.get('embedding_model') == opts.speaker_embedding_model
+        and params.get('embedding_device') == opts.speaker_embedding_device
+    )
 
 
 def _run_mlx_diarization(
@@ -226,7 +190,6 @@ def _run_diarization(
     opts: ProcessingOptions,
     processed_audio_path: Path,
     transcript_dir: Path,
-    whisper_segments: list,
     emit: Callable,
 ) -> List[SpeakerSegment]:
     """Run diarization with caching and post-processing. Returns SpeakerSegment list."""
@@ -240,9 +203,6 @@ def _run_diarization(
             logging.info('Diarization: loading from cache %s', diarization_post_path)
             emit('diarization', 92.0, 'Diarization loaded from cache')
             return _deserialize_segments(payload.get('segments', []))
-
-    if opts.diarization_method == 'llm':
-        return _run_llm_diarization(opts, whisper_segments, diarization_post_path, emit)
 
     return _run_mlx_diarization(opts, processed_audio_path, transcript_dir, diarization_post_path, emit)
 
@@ -263,9 +223,6 @@ def process_audio_file(
         if opts.output_docx
         else audio_path.with_suffix(".docx")
     )
-
-    if opts.transcription_method == 'qwen_asr' and opts.diarization_method == 'llm':
-        raise ValueError('LLM diarization requires whisper transcription method')
 
     emit("start", 0.0, "Starting processing")
     logging.info("Processing started")
@@ -321,7 +278,7 @@ def process_audio_file(
         force = opts.force_whisper or opts.force_diarization
 
         diarization_segments = _run_diarization(
-            opts, processed_audio_path, transcript_dir, whisper_segments=[], emit=emit,
+            opts, processed_audio_path, transcript_dir, emit=emit,
         )
 
         qwen_segments_path = transcript_dir / 'qwen_segments.json'
@@ -417,7 +374,7 @@ def process_audio_file(
             logging.info("Sentences TXT: %s", sentences_txt_path)
 
         diarization_segments = _run_diarization(
-            opts, processed_audio_path, transcript_dir, whisper_segments=whisper_segments, emit=emit,
+            opts, processed_audio_path, transcript_dir, emit=emit,
         )
 
         words = (
@@ -444,18 +401,11 @@ def process_audio_file(
 
     emit('replicas', 95.0, 'Building output replicas')
     explicit_map = parse_speaker_map(opts.speaker_map)
-    if opts.diarization_method == 'llm':
-        explicit_map = {'К': 'К', 'Т': 'Т'}
     role_map = map_speakers_to_roles(replicas, explicit_map)
     for replica in replicas:
         replica['role'] = role_map.get(replica['speaker'], 'К')
 
     if is_qwen_transcription:
-        replicas = validate_roles_with_llm(
-            replicas,
-            llm_model_path=opts.qwen_role_validation_model,
-            enabled=opts.qwen_role_validation_enabled,
-        )
         if opts.merge_adjacent_roles:
             replicas = merge_adjacent_by_role(replicas)
             logging.info('Role merge: merged adjacent qwen replicas to %d entries', len(replicas))

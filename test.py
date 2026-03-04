@@ -12,7 +12,7 @@ from psy_protocol import ProcessingOptions, process_audio_file
 DEFAULT_TESTS_DIR = Path(__file__).parent / 'tests'
 TEST_NUMBERS = list(range(1, 6))
 TRANSCRIPTION_METHODS = ['whisper', 'qwen_asr']
-DIARIZATION_METHODS = ['mlx_segmentation', 'llm']
+DIARIZATION_METHODS = ['mlx_segmentation']
 
 CONFIGS = {
     'default': ProcessingOptions(),
@@ -326,14 +326,14 @@ def main() -> None:
     parser.add_argument(
         '--compare-diarization',
         action='store_true',
-        help='Compare mlx_segmentation vs llm diarization methods (Speaker%%)',
+        help='Compare diarization methods (Speaker%%)',
     )
     parser.add_argument(
         '--diarization-method',
         nargs='+',
         choices=DIARIZATION_METHODS,
         metavar='METHOD',
-        help='Run only specific diarization methods (e.g. --diarization-method llm)',
+        help='Run only specific diarization methods (e.g. --diarization-method mlx_segmentation)',
     )
     parser.add_argument(
         '--compare-transcription',
@@ -389,8 +389,7 @@ def main() -> None:
         methods = args.diarization_method or DIARIZATION_METHODS
         transcription_method = (args.transcription_method or [None])[0]
         for i, method in enumerate(methods):
-            # llm diarization always requires whisper transcription
-            effective_transcription = 'whisper' if method == 'llm' else transcription_method
+            effective_transcription = transcription_method
             extra: dict = {}
             if effective_transcription:
                 extra['transcription_method'] = effective_transcription

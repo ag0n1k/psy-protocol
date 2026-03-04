@@ -27,7 +27,6 @@ from psy_protocol.pipeline import ProcessingOptions, process_audio_file
 
 TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
-SESSION_TTL_SECONDS = 3600  # 1 hour
 
 PRESETS: Dict[str, Dict[str, Any]] = {
     "other_approach": {
@@ -73,7 +72,6 @@ class JobSession:
     work_dir: Path
     audio_path: Path
     base_options: Any  # ProcessingOptions — imported below
-    expires_at: float  # time.monotonic() + TTL
 
 
 # Keyed by chat_id (int)
@@ -236,6 +234,12 @@ def build_retry_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=PRESETS['raw_text']['label'],
                     callback_data='retry:raw_text',
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text='✅ Завершить обработку',
+                    callback_data='session:finish',
                 ),
             ],
         ]
@@ -461,6 +465,26 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
         )
         return
 
+    active_session = job_sessions.get(chat_id)
+    if active_session:
+        if not active_session.audio_path.exists():
+            cleanup_work_dir(active_session.work_dir)
+            job_sessions.pop(chat_id, None)
+        else:
+            await message.answer(
+                "Сейчас уже есть активная обработка этого файла. "
+                "Нажмите «✅ Завершить обработку», чтобы загрузить новый.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text='✅ Завершить обработку',
+                            callback_data='session:finish',
+                        ),
+                    ]]
+                ),
+            )
+            return
+
     download_result = await download_audio(message, bot, settings)
     if not download_result:
         await message.answer(
@@ -491,9 +515,8 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             work_dir=work_dir,
             audio_path=audio_path,
             base_options=options,
-            expires_at=time.monotonic() + SESSION_TTL_SECONDS,
         )
-        logging.info("Session stored for chat_id=%s", chat_id)
+        logging.info("Active file session stored for chat_id=%s", chat_id)
     else:
         logging.error("Failed to process audio from Telegram for chat_id=%s", chat_id)
         await message.answer(
@@ -511,9 +534,9 @@ async def handle_retry_callback(
     chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
 
     session = job_sessions.get(chat_id)
-    if not session or time.monotonic() > session.expires_at:
+    if not session:
         if callback.message:
-            await callback.message.answer("Сессия истекла, отправьте аудио заново.")
+            await callback.message.answer("Активный файл не найден, отправьте аудио заново.")
         return
     if not session.audio_path.exists():
         if callback.message:
@@ -521,9 +544,6 @@ async def handle_retry_callback(
         cleanup_work_dir(session.work_dir)
         job_sessions.pop(chat_id, None)
         return
-
-    # Refresh TTL
-    session.expires_at = time.monotonic() + SESSION_TTL_SECONDS
 
     if preset_key in ('raw_text', 'timed'):
         transcript_dir = Path(session.base_options.transcript_dir) / session.audio_path.stem
@@ -563,6 +583,21 @@ async def handle_retry_callback(
         )
 
 
+async def handle_finish_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
+    session = job_sessions.pop(chat_id, None)
+    if not session:
+        if callback.message:
+            await callback.message.answer('Нет активной обработки. Можете отправить новый файл.')
+        return
+
+    cleanup_work_dir(session.work_dir)
+    logging.info('Session finished and cleaned for chat_id=%s', chat_id)
+    if callback.message:
+        await callback.message.answer('Обработка завершена, кэш очищен. Отправьте новый файл.')
+
+
 async def handle_consent_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
@@ -575,18 +610,6 @@ async def handle_consent_callback(callback: CallbackQuery) -> None:
         await callback.message.answer(
             "✅ Соглашение принято. Отправьте голосовое сообщение или аудиофайл 📄"
         )
-
-
-async def session_cleanup_loop() -> None:
-    while True:
-        await asyncio.sleep(600)  # 10 min
-        now = time.monotonic()
-        expired = [cid for cid, s in list(job_sessions.items()) if now > s.expires_at]
-        for cid in expired:
-            session = job_sessions.pop(cid, None)
-            if session:
-                logging.info("Cleaning up expired session for chat_id=%s", cid)
-                cleanup_work_dir(session.work_dir)
 
 
 def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
@@ -627,6 +650,10 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
     async def handle_retry(callback: CallbackQuery, bot: Bot) -> None:
         await handle_retry_callback(callback, bot, settings)
 
+    @dp.callback_query(F.data == "session:finish")
+    async def handle_finish(callback: CallbackQuery) -> None:
+        await handle_finish_callback(callback)
+
     return dp
 
 
@@ -637,11 +664,9 @@ async def run_bot() -> None:
     logging.info("Starting Telegram bot polling")
     bot = create_bot(settings)
     dp = create_dispatcher(settings)
-    cleanup_task = asyncio.create_task(session_cleanup_loop())
     try:
         await dp.start_polling(bot)
     finally:
-        cleanup_task.cancel()
         await bot.session.close()
 
 
