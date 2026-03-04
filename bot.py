@@ -52,6 +52,10 @@ CONSENT_TEXT = r"""📋 *Пользовательское соглашение*
 
 *Что делает бот:*
 Принимает аудиозаписи, распознаёт речь и формирует текстовый протокол\. Вся обработка выполняется локально, без передачи аудио сторонним облачным сервисам\.
+Этот бот не отменяет прослушивания, валидации, дополнений, исправлений, разбора сессии.
+Цель бота убрать большую часть рутинных операций с текстом.
+Этот бот не гарантирует хорошего качества, он может быть совсем неточен на плохих записях (~5-20% точности), 
+однако на хороших качество на выборке доходило до 75%.
 
 *Ваши данные:*
 • Аудиофайл временно сохраняется для обработки и удаляется по истечении сессии \(1 час\)\.
@@ -63,6 +67,7 @@ CONSENT_TEXT = r"""📋 *Пользовательское соглашение*
 
 *Ваши обязательства:*
 Отправляя аудио, вы подтверждаете, что имеете законное право на передачу данной записи и несёте ответственность за правомерность её использования\.
+Также вы подтверждаете, что полностью прочитали данное соглашение и согласны с ним.
 
 Нажмите «✅ Принять», чтобы продолжить\."""
 
@@ -76,6 +81,7 @@ class JobSession:
 
 # Keyed by chat_id (int)
 job_sessions: Dict[int, "JobSession"] = {}
+processing_chats: set[int] = set()
 PIPELINE_SEMAPHORE = asyncio.Semaphore(1)
 
 CONSENTS_FILE = Path("consents/accepted.txt")
@@ -305,30 +311,16 @@ def build_bar(percent: float) -> str:
 
 def stage_label(stage: str) -> str:
     labels = {
-        "queue": "Ожидание очереди",
-        "start": "Старт",
-        "prepare": "Подготовка",
-        "whisper": "Распознавание (Whisper)",
-        "diarization": "Диаризация",
-        "replicas": "Форматирование",
-        "output": "Формирование файлов",
+        "queue": "Ожидание в очереди",
+        "start": "Идёт обработка аудио",
+        "prepare": "Идёт обработка аудио",
+        "whisper": "Идёт обработка аудио",
+        "diarization": "Идёт обработка аудио",
+        "replicas": "Идёт обработка аудио",
+        "output": "Идёт обработка аудио",
         "done": "Готово",
     }
     return labels.get(stage, stage.title())
-
-
-def stage_hint(stage: str) -> str:
-    hints = {
-        "queue": "Жду завершения предыдущей обработки.",
-        "start": "Запускаю обработку.",
-        "prepare": "Подготавливаю файлы и кэш.",
-        "whisper": "Распознаю речь (Whisper).",
-        "diarization": "Определяю спикеров.",
-        "replicas": "Собираю реплики диалога.",
-        "output": "Формирую итоговые документы.",
-        "done": "Обработка завершена.",
-    }
-    return hints.get(stage, "Обрабатываю аудио.")
 
 
 def render_progress_text(progress: Dict[str, Any]) -> str:
@@ -344,10 +336,8 @@ def render_progress_text(progress: Dict[str, Any]) -> str:
     percent_text = f"{int(value)}%"
 
     return (
-        "⏳ Идёт обработка аудио\n"
-        f"Этап: {stage_label(stage)}\n"
-        f"[{bar}] {percent_text}\n"
-        f"{stage_hint(stage)}"
+        f"⏳ {stage_label(stage)}\n"
+        f"[{bar}] {percent_text}"
     )
 
 
@@ -465,6 +455,12 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
         )
         return
 
+    if chat_id in processing_chats:
+        await message.answer(
+            "Файл уже обрабатывается. Дождитесь завершения или нажмите «✅ Завершить обработку».",
+        )
+        return
+
     active_session = job_sessions.get(chat_id)
     if active_session:
         if not active_session.audio_path.exists():
@@ -485,45 +481,48 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             )
             return
 
-    download_result = await download_audio(message, bot, settings)
-    if not download_result:
-        await message.answer(
-            "Пожалуйста, отправьте голосовое сообщение, аудио или аудиофайл документом 🙏"
+    processing_chats.add(chat_id)
+    try:
+        download_result = await download_audio(message, bot, settings)
+        if not download_result:
+            await message.answer(
+                "Пожалуйста, отправьте голосовое сообщение, аудио или аудиофайл документом 🙏"
+            )
+            return
+
+        work_dir, audio_path, output_docx = download_result
+        status_message = await message.answer(
+            "Спасибо! 😊 Аудио получено, начинаю обработку. "
+            "Пожалуйста, немного подождите ⏳"
         )
-        return
+        options = build_processing_options(settings, output_docx=output_docx, cache_dir=work_dir / "cache")
+        progress = _make_progress()
 
-    work_dir, audio_path, output_docx = download_result
-    status_message = await message.answer(
-        "Спасибо! 😊 Аудио получено, начинаю обработку. "
-        "Пожалуйста, немного подождите ⏳"
-    )
-    chat_id = message.chat.id if message.chat else 0
-    options = build_processing_options(settings, output_docx=output_docx, cache_dir=work_dir / "cache")
-    progress = _make_progress()
-
-    success = await run_pipeline_and_send(
-        chat_id=chat_id,
-        audio_path=audio_path,
-        opts=options,
-        status_message=status_message,
-        reply_target=message,
-        progress=progress,
-    )
-
-    if success:
-        job_sessions[chat_id] = JobSession(
-            work_dir=work_dir,
+        success = await run_pipeline_and_send(
+            chat_id=chat_id,
             audio_path=audio_path,
-            base_options=options,
+            opts=options,
+            status_message=status_message,
+            reply_target=message,
+            progress=progress,
         )
-        logging.info("Active file session stored for chat_id=%s", chat_id)
-    else:
-        logging.error("Failed to process audio from Telegram for chat_id=%s", chat_id)
-        await message.answer(
-            "Извините, не получилось обработать это аудио 😔 "
-            "Пожалуйста, попробуйте другой файл."
-        )
-        cleanup_work_dir(work_dir)
+
+        if success:
+            job_sessions[chat_id] = JobSession(
+                work_dir=work_dir,
+                audio_path=audio_path,
+                base_options=options,
+            )
+            logging.info("Active file session stored for chat_id=%s", chat_id)
+        else:
+            logging.error("Failed to process audio from Telegram for chat_id=%s", chat_id)
+            await message.answer(
+                "Извините, не получилось обработать это аудио 😔 "
+                "Пожалуйста, попробуйте другой файл."
+            )
+            cleanup_work_dir(work_dir)
+    finally:
+        processing_chats.discard(chat_id)
 
 
 async def handle_retry_callback(
@@ -532,6 +531,11 @@ async def handle_retry_callback(
     await callback.answer()
     preset_key = (callback.data or "").split(":", 1)[1]
     chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
+
+    if chat_id in processing_chats:
+        if callback.message:
+            await callback.message.answer('Обработка уже выполняется. Дождитесь завершения.')
+        return
 
     session = job_sessions.get(chat_id)
     if not session:
@@ -566,15 +570,18 @@ async def handle_retry_callback(
         f"⏳ Повторная обработка ({PRESETS[preset_key]['label']})…"
     )
     progress = _make_progress()
-
-    success = await run_pipeline_and_send(
-        chat_id=chat_id,
-        audio_path=session.audio_path,
-        opts=opts,
-        status_message=status_message,
-        reply_target=callback.message,
-        progress=progress,
-    )
+    processing_chats.add(chat_id)
+    try:
+        success = await run_pipeline_and_send(
+            chat_id=chat_id,
+            audio_path=session.audio_path,
+            opts=opts,
+            status_message=status_message,
+            reply_target=callback.message,
+            progress=progress,
+        )
+    finally:
+        processing_chats.discard(chat_id)
 
     if not success:
         logging.error("Failed to retry audio processing for chat_id=%s preset=%s", chat_id, preset_key)
