@@ -7,11 +7,12 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypeVar
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import SimpleFilesPathWrapper, TelegramAPIServer
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -86,6 +87,7 @@ PIPELINE_SEMAPHORE = asyncio.Semaphore(1)
 
 CONSENTS_FILE = Path("consents/accepted.txt")
 consented_users: set[int] = set()
+T = TypeVar('T')
 
 
 def load_consents() -> None:
@@ -103,6 +105,31 @@ def save_consent(chat_id: int) -> None:
     CONSENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with CONSENTS_FILE.open("a", encoding="utf-8") as f:
         f.write(f"{chat_id}\n")
+
+
+async def _run_with_retries(
+    call: Callable[[], Awaitable[T]],
+    operation: str,
+    attempts: int = 3,
+) -> T:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call()
+        except TelegramNetworkError as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            delay = float(attempt)
+            logging.warning(
+                'Telegram timeout during %s (attempt %d/%d), retrying in %.1fs',
+                operation,
+                attempt,
+                attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise last_error or RuntimeError(f'Failed operation: {operation}')
 
 
 @dataclass
@@ -386,11 +413,20 @@ async def run_pipeline_and_send(
         progress["done"] = True
         progress["success"] = True
         await updater_task
-        await reply_target.answer_document(FSInputFile(path=str(txt_path)))
-        await reply_target.answer_document(FSInputFile(path=str(docx_path)))
-        await reply_target.answer(
-            "Если результат неточный — выберите один из вариантов на кнопках ниже.",
-            reply_markup=build_retry_keyboard(),
+        await _run_with_retries(
+            lambda: reply_target.answer_document(FSInputFile(path=str(txt_path))),
+            operation='send txt result',
+        )
+        await _run_with_retries(
+            lambda: reply_target.answer_document(FSInputFile(path=str(docx_path))),
+            operation='send docx result',
+        )
+        await _run_with_retries(
+            lambda: reply_target.answer(
+                "Если результат неточный — выберите один из вариантов на кнопках ниже.",
+                reply_markup=build_retry_keyboard(),
+            ),
+            operation='send retry keyboard',
         )
         return True
     except Exception:
@@ -491,9 +527,12 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             return
 
         work_dir, audio_path, output_docx = download_result
-        status_message = await message.answer(
-            "Спасибо! 😊 Аудио получено, начинаю обработку. "
-            "Пожалуйста, немного подождите ⏳"
+        status_message = await _run_with_retries(
+            lambda: message.answer(
+                "Спасибо! 😊 Аудио получено, начинаю обработку. "
+                "Пожалуйста, немного подождите ⏳"
+            ),
+            operation='send initial status',
         )
         options = build_processing_options(settings, output_docx=output_docx, cache_dir=work_dir / "cache")
         progress = _make_progress()
@@ -528,7 +567,13 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
 async def handle_retry_callback(
     callback: CallbackQuery, bot: Bot, settings: TelegramSettings
 ) -> None:
-    await callback.answer()
+    try:
+        await _run_with_retries(
+            lambda: callback.answer(),
+            operation='ack retry callback',
+        )
+    except TelegramNetworkError:
+        logging.warning('Telegram timeout while acknowledging retry callback')
     preset_key = (callback.data or "").split(":", 1)[1]
     chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
 
@@ -566,8 +611,11 @@ async def handle_retry_callback(
     # Reuse same output_docx path (overwrites previous result)
     opts.output_docx = session.base_options.output_docx
 
-    status_message = await callback.message.answer(
-        f"⏳ Повторная обработка ({PRESETS[preset_key]['label']})…"
+    status_message = await _run_with_retries(
+        lambda: callback.message.answer(
+            f"⏳ Повторная обработка ({PRESETS[preset_key]['label']})…"
+        ),
+        operation='send retry status',
     )
     progress = _make_progress()
     processing_chats.add(chat_id)
@@ -591,7 +639,13 @@ async def handle_retry_callback(
 
 
 async def handle_finish_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
+    try:
+        await _run_with_retries(
+            lambda: callback.answer(),
+            operation='ack finish callback',
+        )
+    except TelegramNetworkError:
+        logging.warning('Telegram timeout while acknowledging finish callback')
     chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
     session = job_sessions.pop(chat_id, None)
     if not session:
@@ -606,7 +660,13 @@ async def handle_finish_callback(callback: CallbackQuery) -> None:
 
 
 async def handle_consent_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
+    try:
+        await _run_with_retries(
+            lambda: callback.answer(),
+            operation='ack consent callback',
+        )
+    except TelegramNetworkError:
+        logging.warning('Telegram timeout while acknowledging consent callback')
     chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
     if chat_id not in consented_users:
         consented_users.add(chat_id)
