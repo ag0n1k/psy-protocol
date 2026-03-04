@@ -31,7 +31,7 @@ SESSION_TTL_SECONDS = 3600  # 1 hour
 
 PRESETS: Dict[str, Dict[str, Any]] = {
     "other_approach": {
-        "label": "🎙 Использовать другой подход",
+        "label": "🎙 Попробовать иначе",
         "transcription_method": "whisper",
     },
     "swap": {
