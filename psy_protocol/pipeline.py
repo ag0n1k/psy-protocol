@@ -420,11 +420,18 @@ def process_audio_file(
 
     logging.info('Generating DOCX: %s', output_docx)
     emit('output', 98.0, 'Generating DOCX and TXT')
-    create_docx(
-        output_path=str(output_docx),
-        replicas=replicas,
-        metadata=metadata,
-    )
+    try:
+        create_docx(
+            output_path=str(output_docx),
+            replicas=replicas,
+            metadata=metadata,
+        )
+    except Exception:
+        logging.exception('DOCX generation or validation failed: %s', output_docx)
+        raise
+    if not output_docx.exists():
+        raise RuntimeError(f'DOCX output file was not created: {output_docx}')
+    logging.info('DOCX ready: %s (%d bytes)', output_docx, output_docx.stat().st_size)
     dialogue_txt_path = output_docx.with_suffix('.txt')
     save_dialogue_txt(dialogue_txt_path, replicas)
     logging.info('Dialogue TXT: %s', dialogue_txt_path)

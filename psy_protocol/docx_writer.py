@@ -1,3 +1,7 @@
+import os
+import tempfile
+import zipfile
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from docx import Document
@@ -26,6 +30,22 @@ from .config import (
 )
 
 
+def sanitize_docx_text(value: str) -> str:
+    cleaned_chars = []
+    for ch in value:
+        code = ord(ch)
+        if ch in ('\t', '\n', '\r'):
+            cleaned_chars.append(ch)
+            continue
+        if (
+            0x20 <= code <= 0xD7FF
+            or 0xE000 <= code <= 0xFFFD
+            or 0x10000 <= code <= 0x10FFFF
+        ):
+            cleaned_chars.append(ch)
+    return ''.join(cleaned_chars)
+
+
 def create_docx(
     output_path: str,
     replicas: List[Dict[str, str]],
@@ -38,7 +58,7 @@ def create_docx(
     set_default_font(doc, DEFAULT_FONT_NAME)
 
     for label, value in metadata.items():
-        line = f"{label}: {value}" if value else label
+        line = sanitize_docx_text(f"{label}: {value}" if value else label)
         paragraph = doc.add_paragraph()
         set_paragraph_spacing(
             paragraph,
@@ -74,7 +94,48 @@ def create_docx(
         set_cell_text(row.cells[1], replica["role"], bold=True, font_name=TABLE_FONT_NAME)
         set_cell_text(row.cells[2], replica["text"], bold=False, font_name=TABLE_FONT_NAME)
 
-    doc.save(output_path)
+    save_docx_safely(doc, output_path)
+
+
+def validate_docx_structure(path: str) -> None:
+    required_entries = {
+        '[Content_Types].xml',
+        '_rels/.rels',
+        'word/document.xml',
+    }
+    try:
+        with zipfile.ZipFile(path, 'r') as archive:
+            names = set(archive.namelist())
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f'Invalid DOCX zip container: {path}') from exc
+
+    missing = sorted(required_entries - names)
+    if missing:
+        missing_joined = ', '.join(missing)
+        raise ValueError(f'DOCX is missing required entries: {missing_joined}')
+
+
+def save_docx_safely(doc: Document, output_path: str) -> None:
+    output = Path(output_path).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(output.parent),
+        prefix=f'.{output.stem}.',
+        suffix='.docx',
+    )
+    os.close(fd)
+
+    try:
+        doc.save(tmp_path)
+        validate_docx_structure(tmp_path)
+        os.replace(tmp_path, output)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def set_default_font(doc: Document, font_name: str) -> None:
@@ -108,7 +169,7 @@ def set_cell_text(
     bold: bool = False,
     font_name: str = DEFAULT_FONT_NAME,
 ) -> None:
-    cell.text = text
+    cell.text = sanitize_docx_text(text)
     if not cell.paragraphs:
         return
     for paragraph in cell.paragraphs:
