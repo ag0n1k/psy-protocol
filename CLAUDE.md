@@ -453,3 +453,124 @@ t = (1,)  # без этой запятой будет не tuple, а int
 какие-то разовые скрипты – всё под нож.
 
 Всё, что не нужно прямо сейчас и не понадобится в течение месяца – под нож.
+
+---
+
+# Проект psy-protocol
+
+Пайплайн для транскрибации аудиозаписей психологических (гештальт-терапевтических) сессий
+с диаризацией спикеров и классификацией ролей К (клиент) / Т (терапевт).
+
+## Точки входа
+
+- `python main.py` — CLI (вызывает `psy_protocol.cli.main()`)
+- `python bot.py` — Telegram-бот (aiogram v3)
+- `from psy_protocol import process_audio_file` — программный API
+
+## Структура пакета psy_protocol
+
+```
+psy_protocol/
+├── __init__.py                 # Экспорт: ProcessingOptions, process_audio_file
+├── pipeline.py                 # Оркестратор: process_audio_file() вызывает stages по очереди
+├── cli.py                      # CLI-парсер, субкоманды: full, asr, diarize, align, llm, from-text
+├── config.py                   # Константы: модели, шрифты, отступы, дефолты LLM
+├── models.py                   # Dataclass-ы: AsrResult, DiarizationResult, Replica, AlignmentResult, LlmResult
+├── stages/
+│   ├── asr.py                  # Stage 1: транскрибация (Whisper-MLX / Qwen3-ASR) с кэшем
+│   ├── diarization_stage.py    # Stage 2: диаризация (pyannote-MLX + SpeechBrain эмбеддинги)
+│   ├── alignment_stage.py      # Stage 3: выравнивание ASR + диаризация → реплики с ролями
+│   ├── llm_stage.py            # Stage 4: LLM-улучшение (role_validation, text_correction, analysis)
+│   └── output_stage.py         # Stage 5: генерация DOCX + TXT
+├── alignment.py                # Низкоуровневое выравнивание слов/сегментов со спикерами
+├── diarization.py              # MLX-диаризация, кластеризация эмбеддингов, пост-процессинг
+├── whisper_transcribe.py       # Обёртка mlx_whisper с прогресс-колбэком
+├── qwen_transcribe.py          # Qwen3-ASR альтернатива Whisper
+├── audio_preprocess.py         # ffmpeg-нормализация (16kHz mono)
+├── roles.py                    # Маппинг SPEAKER_XX → К/Т (по объёму речи)
+├── text_postprocess.py         # Очистка текста: повторы, ghost words, филлеры
+├── replica_postprocess.py      # Склейка соседних реплик одной роли
+├── docx_writer.py              # Генерация DOCX-таблицы (7 колонок, landscape A4)
+├── text_outputs.py             # Сохранение dialogue.txt, timed_dialogue.txt, sentences.txt
+└── io_utils.py                 # load_json, save_json, save_text
+```
+
+## Стадии пайплайна
+
+```
+Аудио → [Stage 0: ffmpeg preprocess] →
+  Stage 1 (ASR): Whisper-MLX или Qwen3-ASR → AsrResult
+  Stage 2 (Diarization): pyannote-MLX + SpeechBrain → DiarizationResult
+  Stage 3a (Alignment): ASR + Diarization → AlignmentResult (unremerged реплики с ролями)
+  Stage 4 (LLM, опционально): OpenAI SDK → LMStudio → LlmResult
+  Stage 3b (Merge): склейка соседних реплик одной роли
+  Stage 5 (Output): DOCX + TXT
+```
+
+Все промежуточные результаты кэшируются в `transcripts/<audio_stem>/`.
+
+## Telegram-бот (bot.py)
+
+- Принимает голосовые, аудио и документы
+- Текстовые файлы с форматом `К: ... / Т: ...` → парсинг → DOCX (без аудио-пайплайна)
+- Аудио → полный пайплайн с прогресс-баром в сообщении
+- Пресеты повторной обработки: swap К↔Т, другой метод, сырой текст, таймкоды
+- Семафор на 1 параллельный пайплайн
+- Согласие пользователя хранится в `consents/accepted.txt`
+- Настройки из `.env`: TELEGRAM_BOT_TOKEN, PSY_WHISPER_MODEL, PSY_DIARIZATION_MODEL, PSY_MAX_SPEAKERS
+
+## CLI субкоманды
+
+```bash
+python main.py full --audio file.wav          # полный пайплайн
+python main.py asr --audio file.wav           # только транскрибация
+python main.py diarize --audio file.wav       # только диаризация
+python main.py align --cache-dir transcripts/stem  # выравнивание из кэша
+python main.py llm --cache-dir transcripts/stem    # LLM из кэша
+python main.py from-text --input dialog.txt   # текст → DOCX
+python main.py --audio file.wav               # legacy (= full)
+```
+
+## Ключевые модели данных (models.py)
+
+- `AsrResult` — текст + сегменты + слова + метод + модель
+- `DiarizationResult` — сегменты спикеров + метод + параметры
+- `Replica` — speaker, role (К/Т), text, start, end
+- `AlignmentResult` — список Replica (до мерджа)
+- `LlmResult` — список Replica + анализ сессии
+- `ProcessingOptions` — все параметры пайплайна (~25 полей)
+
+## DOCX-формат
+
+Таблица 7 колонок (landscape A4):
+№ | К/Т | Реплика | Феномены клиента | Комментарии к процессу клиента | Комментарии к интервенциям терапевта | Внутренняя динамика терапевта
+
+Заполняются только первые 3 колонки; остальные — для ручного заполнения.
+
+## LLM-стадия (Stage 4)
+
+- API: OpenAI SDK → LMStudio (http://localhost:1234/v1)
+- Модель: qwen3.5-9b (по умолчанию)
+- Задачи: role_validation (К/Т по содержанию), text_correction (пунктуация, опечатки), analysis
+- Включается: `--llm`
+- По умолчанию выключена
+
+## Зависимости
+
+```
+mlx-whisper, mlx-audio, mlx, mlx-lm    # Apple Silicon ML
+numpy, torch, torchaudio, torchcodec   # Числовые + аудио
+speechbrain                             # Спикер-эмбеддинги
+python-docx                             # DOCX
+huggingface_hub                         # Загрузка моделей
+openai                                  # LLM через LMStudio
+aiogram                                 # Telegram-бот
+```
+
+Системная зависимость: `ffmpeg` (`brew install ffmpeg`).
+
+## Инфраструктура
+
+- `docker-compose.yml`: telegram-bot-api, nginx, victoria-metrics, node-exporter, grafana
+- `Makefile`: macOS LaunchAgent (install/start/stop/restart/status/logs)
+- `infra/`: конфиги мониторинга (prometheus.yml, grafana dashboards/provisioning)
