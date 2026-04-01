@@ -278,6 +278,22 @@ def _build_llm_parser(subparsers) -> argparse.ArgumentParser:
     return p
 
 
+def _build_from_text_parser(subparsers) -> argparse.ArgumentParser:
+    p = subparsers.add_parser(
+        'from-text',
+        help='Собрать DOCX из текстового файла с репликами (К:/Т:)',
+    )
+    p.add_argument('--input', required=True, help='Путь к текстовому файлу с репликами')
+    p.add_argument('--output-docx', default=None, help='Путь к выходному DOCX (по умолчанию: <input>.docx)')
+    p.add_argument('--fio', default='', help='ФИО')
+    p.add_argument('--group', default='', help='Номер группы')
+    p.add_argument('--date', default='', help='Дата')
+    p.add_argument('--topic', default='', help='Тема протокола')
+    p.add_argument('--task', default='', help='Задание')
+    p.add_argument('--log-level', default='INFO', help='Уровень логирования')
+    return p
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Транскрибировать аудио, определить спикеров и собрать DOCX.',
@@ -290,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_diarize_parser(subparsers)
     _build_align_parser(subparsers)
     _build_llm_parser(subparsers)
+    _build_from_text_parser(subparsers)
 
     # Legacy flat args for backward compatibility (no subcommand)
     parser.add_argument('--audio', default=None, help='Путь к аудиофайлу')
@@ -450,6 +467,76 @@ def _run_align(args) -> None:
     logging.info('Alignment done: %d segments saved to %s', len(alignment.segments), cache_dir / 'alignment_result.json')
 
 
+def _parse_text_file(text: str) -> list:
+    """Parse text with lines like 'К: ...' / 'Т: ...' into replica dicts."""
+    import re
+    replicas = []
+    current_role = None
+    current_lines = []
+
+    for line in text.splitlines():
+        match = re.match(r'^([КТ]):\s*(.*)', line)
+        if match:
+            if current_role is not None and current_lines:
+                replicas.append({
+                    'role': current_role,
+                    'text': ' '.join(current_lines),
+                })
+            current_role = match.group(1)
+            first_text = match.group(2).strip()
+            current_lines = [first_text] if first_text else []
+        elif current_role is not None:
+            stripped = line.strip()
+            if stripped:
+                current_lines.append(stripped)
+
+    if current_role is not None and current_lines:
+        replicas.append({
+            'role': current_role,
+            'text': ' '.join(current_lines),
+        })
+
+    return replicas
+
+
+def _run_from_text(args) -> None:
+    from .docx_writer import create_docx
+
+    input_path = Path(args.input).expanduser()
+    if not input_path.exists():
+        logging.error('Input file not found: %s', input_path)
+        return
+
+    text = input_path.read_text(encoding='utf-8')
+    replicas = _parse_text_file(text)
+    if not replicas:
+        logging.error('No replicas found in %s (expected lines like "К: ..." or "Т: ...")', input_path)
+        return
+
+    logging.info('Parsed %d replicas from %s', len(replicas), input_path)
+
+    output_docx = (
+        Path(args.output_docx).expanduser()
+        if args.output_docx
+        else input_path.with_suffix('.docx')
+    )
+
+    metadata = {
+        'ФИО': args.fio,
+        'Номер группы': args.group,
+        'Дата': args.date,
+        'Тема протокола': args.topic,
+        'Задание': args.task,
+    }
+
+    create_docx(
+        output_path=str(output_docx),
+        replicas=replicas,
+        metadata=metadata,
+    )
+    logging.info('DOCX ready: %s', output_docx)
+
+
 def _run_llm(args) -> None:
     from pathlib import Path
     from .models import AlignmentResult
@@ -492,6 +579,7 @@ def main() -> None:
         'diarize': _run_diarize,
         'align': _run_align,
         'llm': _run_llm,
+        'from-text': _run_from_text,
     }
     handler = dispatch.get(command)
     if handler:

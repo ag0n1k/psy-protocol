@@ -22,7 +22,9 @@ from aiogram.types import (
     Message,
 )
 
+from psy_protocol.cli import _parse_text_file
 from psy_protocol.config import LOG_FORMAT
+from psy_protocol.docx_writer import create_docx
 from psy_protocol.pipeline import ProcessingOptions, process_audio_file
 
 
@@ -481,6 +483,63 @@ def _make_progress() -> Dict[str, Any]:
     }
 
 
+async def process_text_file_and_reply(message: Message, bot: Bot) -> None:
+    """Download a text document, parse К:/Т: replicas, generate and send DOCX."""
+    chat_id = message.chat.id if message.chat else 0
+    if chat_id not in consented_users:
+        await message.answer(
+            CONSENT_TEXT,
+            parse_mode='HTML',
+            reply_markup=build_consent_keyboard(),
+        )
+        return
+
+    file_id = message.document.file_id
+    work_dir = TEMP_ROOT / f'{chat_id}_{message.message_id}'
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    original_name = message.document.file_name or 'input.txt'
+    input_path = work_dir / original_name
+    tg_file = await bot.get_file(file_id)
+    await bot.download_file(tg_file.file_path or '', destination=input_path)
+
+    text = input_path.read_text(encoding='utf-8')
+    replicas = _parse_text_file(text)
+    if not replicas:
+        await message.answer(
+            'Не удалось найти реплики в файле. '
+            'Ожидается формат: строки вида «К: текст» и «Т: текст».',
+        )
+        cleanup_work_dir(work_dir)
+        return
+
+    logging.info(
+        'Text file from chat_id=%s: %d replicas parsed', chat_id, len(replicas),
+    )
+
+    output_docx = work_dir / Path(original_name).with_suffix('.docx').name
+    metadata = {'ФИО': '', 'Номер группы': '', 'Дата': '', 'Тема протокола': '', 'Задание': ''}
+
+    try:
+        await asyncio.to_thread(
+            create_docx,
+            output_path=str(output_docx),
+            replicas=replicas,
+            metadata=metadata,
+        )
+    except Exception:
+        logging.exception('DOCX generation failed for text file, chat_id=%s', chat_id)
+        await message.answer('Не удалось сгенерировать DOCX 😔')
+        cleanup_work_dir(work_dir)
+        return
+
+    await _run_with_retries(
+        lambda: message.answer_document(FSInputFile(path=str(output_docx))),
+        operation='send text-to-docx result',
+    )
+    cleanup_work_dir(work_dir)
+
+
 async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettings) -> None:
     chat_id = message.chat.id if message.chat else 0
     if chat_id not in consented_users:
@@ -711,6 +770,12 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
 
     @dp.message(F.document)
     async def handle_document(message: Message, bot: Bot) -> None:
+        mime = message.document.mime_type or '' if message.document else ''
+        fname = (message.document.file_name or '') if message.document else ''
+        is_text = mime.startswith('text/') or fname.endswith('.txt')
+        if is_text:
+            await process_text_file_and_reply(message, bot)
+            return
         await process_and_reply(message, bot, settings)
 
     @dp.callback_query(F.data.startswith("retry:"))
