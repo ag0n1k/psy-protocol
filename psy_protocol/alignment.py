@@ -3,6 +3,70 @@ from typing import Dict, List, Optional, Tuple
 from .diarization import SpeakerSegment
 
 
+def assign_segments_without_merge(
+    whisper_segments: List[Dict],
+    diarization_segments: List[SpeakerSegment],
+) -> List[Dict]:
+    """Assign speakers to whisper segments without merging adjacent same-speaker entries."""
+    speakers = assign_speakers_to_segments(whisper_segments, diarization_segments)
+    result = []
+    for seg, speaker in zip(whisper_segments, speakers):
+        text = seg.get('text', '').strip()
+        if not text:
+            continue
+        result.append({
+            'speaker': speaker,
+            'text': text,
+            'start': float(seg.get('start', 0.0)),
+            'end': float(seg.get('end', 0.0)),
+        })
+    return result
+
+
+def assign_words_without_merge(
+    words: List[Dict],
+    whisper_segments: List[Dict],
+    diarization_segments: List[SpeakerSegment],
+    smooth_min_words: int,
+) -> List[Dict]:
+    """Assign speakers at word level, smooth, then group back into whisper segments."""
+    if not words:
+        return []
+    spans = [(w['start'], w['end']) for w in words]
+    speakers = assign_speakers_to_spans(spans, diarization_segments)
+    speakers = smooth_word_speakers(speakers, min_words=smooth_min_words)
+
+    word_spk_pairs = list(zip(words, speakers))
+    result = []
+    for seg in whisper_segments:
+        seg_start = float(seg.get('start', 0.0))
+        seg_end = float(seg.get('end', seg_start))
+        text = seg.get('text', '').strip()
+        if not text:
+            continue
+
+        seg_speakers = [
+            spk for w, spk in word_spk_pairs
+            if w['start'] >= seg_start - 0.05 and w['end'] <= seg_end + 0.05
+        ]
+
+        if seg_speakers:
+            counts: Dict[str, int] = {}
+            for spk in seg_speakers:
+                counts[spk] = counts.get(spk, 0) + 1
+            speaker = max(counts, key=lambda k: counts[k])
+        else:
+            speaker = assign_speakers_to_segments([seg], diarization_segments)[0]
+
+        result.append({
+            'speaker': speaker,
+            'text': text,
+            'start': seg_start,
+            'end': seg_end,
+        })
+    return result
+
+
 def assign_speakers_to_spans(
     spans: List[Tuple[float, float]],
     diarization_segments: List[SpeakerSegment],
