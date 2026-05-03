@@ -786,6 +786,10 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
     async def handle_finish(callback: CallbackQuery) -> None:
         await handle_finish_callback(callback)
 
+    @dp.message()
+    async def handle_any(message: Message) -> None:
+        await handle_start(message)
+
     return dp
 
 
