@@ -1,4 +1,6 @@
 LABEL = com.psy-protocol.bot
+BOOT_DOMAIN = gui/$(shell id -u)
+BOOT_TARGET = $(BOOT_DOMAIN)/$(LABEL)
 PLIST = $(HOME)/Library/LaunchAgents/$(LABEL).plist
 
 service-install:
@@ -6,6 +8,12 @@ service-install:
 
 service-uninstall:
 	bash infra/macos/uninstall.sh
+
+service-bootstrap:
+	launchctl bootstrap $(BOOT_DOMAIN) $(PLIST)
+
+service-bootout:
+	launchctl bootout $(BOOT_TARGET)
 
 service-start:
 	launchctl start $(LABEL)
