@@ -5,13 +5,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    command:
-      - --api-id=${TELEGRAM_API_ID}
-      - --api-hash=${TELEGRAM_API_HASH}
-      - --local
-      - --http-port=8081
-      - --dir=/var/lib/telegram-bot-api
-      - --verbosity=1
+    environment:
+      # entrypoint собирает CLI из ENV; обычный command: игнорируется
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_VERBOSITY: "1"
     ports:
       - "${TELEGRAM_LOCAL_API_PORT:-8081}:8081"
       - "8082:8082"
