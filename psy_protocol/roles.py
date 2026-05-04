@@ -32,14 +32,16 @@ def map_speakers_to_roles(
 ) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     order: List[str] = []
+    seen: set = set()
     for replica in replicas:
         speaker = replica['speaker']
-        if speaker in mapping:
+        if speaker in mapping or speaker in seen:
             continue
         if speaker in explicit_map:
             mapping[speaker] = explicit_map[speaker]
         else:
             order.append(speaker)
+        seen.add(speaker)
 
     if len(order) >= 2:
         volume: Dict[str, int] = {}
