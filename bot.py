@@ -320,6 +320,14 @@ async def download_audio(
     if not file_id:
         return None
 
+    media = message.voice or message.audio or message.document
+    media_size = getattr(media, "file_size", None) if media else None
+    media_kind = type(media).__name__ if media else "unknown"
+    logging.info(
+        "download_audio: kind=%s file_size=%s file_id=%s",
+        media_kind, media_size, file_id,
+    )
+
     work_dir, audio_path, output_docx = build_work_paths(message, suffix)
     tg_file = await bot.get_file(file_id)
     file_path = tg_file.file_path or ""
