@@ -1,5 +1,6 @@
 # Local environment and IDE
 .env
+.env.bak*
 .idea/
 logs/*.log
 
