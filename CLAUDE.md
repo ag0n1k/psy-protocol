@@ -573,5 +573,7 @@ aiogram                                 # Telegram-бот
 ## Инфраструктура
 
 - `docker-compose.yml`: telegram-bot-api, nginx, victoria-metrics, node-exporter, grafana
-- `Makefile`: macOS LaunchAgent (install/start/stop/restart/status/logs)
+- `Makefile`: macOS LaunchAgent'ы — бот (`service-*`) и watchdog (`watchdog-*`)
+- `infra/macos/watchdog.sh`: раз в 120 с проверяет `http://127.0.0.1:8020`; если недоступен —
+  `orb start`, `docker compose up -d`, `launchctl kickstart` бота. Лог: `logs/watchdog.log`
 - `infra/`: конфиги мониторинга (prometheus.yml, grafana dashboards/provisioning)
