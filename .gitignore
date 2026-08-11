@@ -22,3 +22,6 @@ tests/
 
 # Infra build artifacts
 infra/*.tar.gz
+
+# Рабочие заметки и планы — не для репозитория
+plans/
