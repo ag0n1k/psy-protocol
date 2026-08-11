@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import copy
+import json
 import logging
 import logging.handlers
 import os
@@ -46,6 +47,7 @@ PHOTO_CAPTION_LIMIT = 1024
 DEFAULT_MAX_AUDIO_MINUTES = 120
 DEFAULT_MAX_AUDIO_MB = 300
 DEFAULT_MAX_QUEUE_LENGTH = 5
+DEFAULT_DATA_TTL_DAYS = 30
 
 LOG_FILE = Path('logs/bot.log')
 LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -83,7 +85,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-CONSENT_TEXT = """📋 <b>Пользовательское соглашение</b>
+CONSENT_TEMPLATE = """📋 <b>Пользовательское соглашение</b>
 
 Перед использованием бота ознакомьтесь с условиями обработки данных.
 
@@ -95,8 +97,9 @@ CONSENT_TEXT = """📋 <b>Пользовательское соглашение<
 однако на хороших качество на выборке доходило до 75%.
 
 <b>Ваши данные:</b>
-• Аудиофайл временно сохраняется для обработки и удаляется по истечении сессии (1 час).
-• Результаты (TXT, DOCX) хранятся в течение сессии и удаляются вместе с аудио.
+• Аудиофайл сохраняется для обработки и автоматически удаляется через {ttl_days} дн.
+• Результаты (TXT, DOCX) хранятся столько же и удаляются вместе с аудио.
+• Удалить всё раньше и отозвать согласие можно командой /forget.
 • Данные не передаются и не продаются третьим лицам.
 
 <b>Ответственность:</b>
@@ -134,15 +137,19 @@ PIPELINE_SEMAPHORE = asyncio.Semaphore(1)
 
 pipeline_queue: "list[QueueTicket]" = []
 
-# Соглашение обещает удаление аудио и результатов через час — этот срок и выдерживаем.
-SESSION_TTL_SECONDS = 3600
 CLEANUP_INTERVAL_SECONDS = 300
+SESSIONS_FILE = TEMP_ROOT / "sessions.json"
 
 CONSENTS_FILE = Path("consents/accepted.txt")
 consented_users: set[int] = set()
 # Кому доступна /stats; заполняется в run_bot() из PSY_ADMIN_CHAT_IDS.
 admin_chat_ids: set[int] = set()
 T = TypeVar('T')
+
+
+def build_consent_text() -> str:
+    """Соглашение со сроком хранения из настроек: обещание не расходится с уборщиком."""
+    return CONSENT_TEMPLATE.format(ttl_days=limits.data_ttl_days)
 
 
 def load_consents() -> None:
@@ -219,6 +226,13 @@ class Limits:
     max_audio_bytes: int = DEFAULT_MAX_AUDIO_MB * 1024 * 1024
     # Сколько задач может ждать очереди, не считая обрабатываемой сейчас.
     max_queue_length: int = DEFAULT_MAX_QUEUE_LENGTH
+    # Срок хранения аудио и результатов; он же подставляется в текст соглашения,
+    # чтобы обещание пользователю и поведение уборщика не разъезжались.
+    data_ttl_days: int = DEFAULT_DATA_TTL_DAYS
+
+    @property
+    def data_ttl_seconds(self) -> int:
+        return self.data_ttl_days * 24 * 60 * 60
 
 
 limits = Limits()
@@ -303,12 +317,14 @@ def load_limits(env: Optional[Dict[str, str]] = None) -> Limits:
         max_audio_seconds=_env_int(env, 'PSY_MAX_AUDIO_MINUTES', DEFAULT_MAX_AUDIO_MINUTES) * 60,
         max_audio_bytes=_env_int(env, 'PSY_MAX_AUDIO_MB', DEFAULT_MAX_AUDIO_MB) * 1024 * 1024,
         max_queue_length=_env_int(env, 'PSY_MAX_QUEUE_LENGTH', DEFAULT_MAX_QUEUE_LENGTH),
+        data_ttl_days=_env_int(env, 'PSY_DATA_TTL_DAYS', DEFAULT_DATA_TTL_DAYS),
     )
     logging.info(
-        'Limits: audio <= %d min / %d MB, queue <= %d waiting',
+        'Limits: audio <= %d min / %d MB, queue <= %d waiting, data kept %d days',
         loaded.max_audio_seconds // 60,
         loaded.max_audio_bytes // (1024 * 1024),
         loaded.max_queue_length,
+        loaded.data_ttl_days,
     )
     return loaded
 
@@ -604,33 +620,76 @@ def tree_mtime(path: Path) -> float:
     return latest
 
 
-def purge_temp_root() -> None:
-    """Снести всё временное при старте: после рестарта активных задач заведомо нет."""
-    if not TEMP_ROOT.exists():
+def save_sessions() -> None:
+    """Сохранить сессии, чтобы кнопки повтора пережили рестарт бота."""
+    payload = [
+        {
+            'chat_id': chat_id,
+            'work_dir': str(session.work_dir),
+            'audio_path': str(session.audio_path),
+            'created_at': session.created_at,
+        }
+        for chat_id, session in job_sessions.items()
+    ]
+    try:
+        SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSIONS_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding='utf-8',
+        )
+    except OSError:
+        logging.warning('Failed to persist sessions', exc_info=True)
+
+
+def load_sessions(settings: TelegramSettings) -> None:
+    """Восстановить сессии; ProcessingOptions пересобираются из путей, они детерминированы."""
+    if not SESSIONS_FILE.exists():
         return
-    removed = 0
-    for child in TEMP_ROOT.iterdir():
-        if child.is_dir():
-            cleanup_work_dir(child)
-            removed += 1
-    if removed:
-        logging.info("Purged %d stale work dirs at startup", removed)
+    try:
+        payload = json.loads(SESSIONS_FILE.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        logging.warning('Failed to read persisted sessions', exc_info=True)
+        return
+
+    restored = 0
+    for item in payload:
+        work_dir = Path(item['work_dir'])
+        audio_path = Path(item['audio_path'])
+        if not audio_path.exists():
+            cleanup_work_dir(work_dir)
+            continue
+        job_sessions[int(item['chat_id'])] = JobSession(
+            work_dir=work_dir,
+            audio_path=audio_path,
+            base_options=build_processing_options(
+                settings,
+                output_docx=work_dir / 'result.docx',
+                cache_dir=work_dir / 'cache',
+            ),
+            created_at=float(item['created_at']),
+        )
+        restored += 1
+    logging.info('Restored %d sessions from disk', restored)
 
 
 def cleanup_expired_data() -> int:
-    """Удалить аудио и результаты старше SESSION_TTL_SECONDS. Возвращает число каталогов."""
+    """Удалить аудио и результаты старше срока хранения. Возвращает число каталогов."""
     now = time.time()
     removed = 0
+    changed = False
 
     for chat_id, session in list(job_sessions.items()):
         if session.work_dir in active_work_dirs:
             continue
-        if now - session.created_at < SESSION_TTL_SECONDS:
+        if now - session.created_at < limits.data_ttl_seconds:
             continue
         cleanup_work_dir(session.work_dir)
         job_sessions.pop(chat_id, None)
+        changed = True
         removed += 1
         logging.info("Session data expired and removed for chat_id=%s", chat_id)
+
+    if changed:
+        save_sessions()
 
     # Каталоги без сессии: остались от упавших задач или от прошлых запусков.
     known_dirs = {session.work_dir for session in job_sessions.values()} | active_work_dirs
@@ -639,7 +698,7 @@ def cleanup_expired_data() -> int:
             if not child.is_dir() or child in known_dirs:
                 continue
             try:
-                if now - tree_mtime(child) < SESSION_TTL_SECONDS:
+                if now - tree_mtime(child) < limits.data_ttl_seconds:
                     continue
             except OSError:
                 continue
@@ -916,7 +975,7 @@ async def process_text_file_and_reply(message: Message, bot: Bot) -> None:
     chat_id = message.chat.id
     if chat_id not in consented_users:
         await message.answer(
-            CONSENT_TEXT,
+            build_consent_text(),
             parse_mode='HTML',
             reply_markup=build_consent_keyboard(),
         )
@@ -981,7 +1040,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
     chat_id = message.chat.id
     if chat_id not in consented_users:
         await message.answer(
-            CONSENT_TEXT,
+            build_consent_text(),
             parse_mode="HTML",
             reply_markup=build_consent_keyboard(),
         )
@@ -1013,6 +1072,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
         if not active_session.audio_path.exists():
             cleanup_work_dir(active_session.work_dir)
             job_sessions.pop(chat_id, None)
+            save_sessions()
         else:
             await message.answer(
                 "Сейчас уже есть активная обработка этого файла. "
@@ -1082,6 +1142,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
                 base_options=options,
                 created_at=time.time(),
             )
+            save_sessions()
             logging.info("Active file session stored for chat_id=%s", chat_id)
         else:
             logging.error("Failed to process audio from Telegram for chat_id=%s", chat_id)
@@ -1141,6 +1202,7 @@ async def handle_retry_callback(
         await callback.message.answer('Исходный аудиофайл недоступен, отправьте аудио заново.')
         cleanup_work_dir(session.work_dir)
         job_sessions.pop(chat_id, None)
+        save_sessions()
         return
 
     if preset_key in ('raw_text', 'timed'):
@@ -1218,6 +1280,7 @@ async def handle_finish_callback(callback: CallbackQuery) -> None:
         return
 
     cleanup_work_dir(session.work_dir)
+    save_sessions()
     logging.info('Session finished and cleaned for chat_id=%s', chat_id)
     await callback.message.answer('Обработка завершена, кэш очищен. Отправьте новый файл.')
 
@@ -1253,6 +1316,7 @@ async def handle_forget_callback(callback: CallbackQuery) -> None:
     session = job_sessions.pop(chat_id, None)
     if session:
         cleanup_work_dir(session.work_dir)
+    save_sessions()
     revoke_consent(chat_id)
     logging.info('Data removed and consent revoked for chat_id=%s', chat_id)
 
@@ -1302,7 +1366,7 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
             )
         else:
             await message.answer(
-                CONSENT_TEXT,
+                build_consent_text(),
                 parse_mode="HTML",
                 reply_markup=build_consent_keyboard(),
             )
@@ -1381,7 +1445,7 @@ async def run_bot() -> None:
     admin_chat_ids = load_admin_chat_ids(env)
     limits = load_limits(env)
     ensure_temp_root()
-    purge_temp_root()
+    load_sessions(settings)
     load_consents()
     logging.info("Starting Telegram bot polling")
     bot = create_bot(settings)
