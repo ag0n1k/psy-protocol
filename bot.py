@@ -32,16 +32,18 @@ from psy_protocol.pipeline import ProcessingOptions, process_audio_file
 TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
 
-DONATE_URL = 'https://pay.cloudtips.ru/p/85d6f45a'
 DONATE_BANNER = Path('assets/donate_banner.png')
-DONATE_BUTTON_TEXT = '☕️ Купить кофе'
-DONATE_TEXT = (
+DONATE_LINK_BUTTON_TEXT = '☕️ Купить кофе'
+DONATE_TON_BUTTON_TEXT = '💎 USDT (TON)'
+# USD₮ jetton master on TON: https://tonscan.com/EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs
+TON_USDT_JETTON_MASTER = 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs'
+DONATE_INTRO = (
     '☕️ <b>Кофе для бота</b>\n\n'
     'Бот работает на домашней машине: транскрипции считаются локально, '
     'без облаков и подписок. Если он сэкономил вам час рутины — '
     'можно поддержать проект на кофе и электричество.\n\n'
-    'Любая сумма по желанию, оплата картой или СБП. Это не влияет '
-    'на работу бота: всё бесплатно и остаётся бесплатным.'
+    'Любая сумма по желанию. Это не влияет на работу бота: '
+    'всё бесплатно и остаётся бесплатным.'
 )
 
 PRESETS: Dict[str, Dict[str, Any]] = {
@@ -159,6 +161,22 @@ class TelegramSettings:
     max_speakers: Optional[int] = None
 
 
+@dataclass
+class DonateSettings:
+    """Реквизиты для донатов, задаются только через окружение."""
+
+    link_url: Optional[str] = None
+    ton_address: Optional[str] = None
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.link_url or self.ton_address)
+
+
+# Заполняется в run_bot(): клавиатуры собираются там, куда settings не прокидываются.
+donate_settings = DonateSettings()
+
+
 def parse_env_file(path: Path) -> Dict[str, str]:
     if not path.exists():
         return {}
@@ -195,6 +213,19 @@ def load_settings() -> TelegramSettings:
         diarization_model=env.get("PSY_DIARIZATION_MODEL"),
         max_speakers=int(max_speakers) if max_speakers else None,
     )
+
+
+def load_donate_settings() -> DonateSettings:
+    env = {**parse_env_file(Path(".env")), **os.environ}
+    settings = DonateSettings(
+        link_url=env.get("PSY_DONATE_URL") or None,
+        ton_address=env.get("PSY_DONATE_TON_ADDRESS") or None,
+    )
+    if not settings.is_configured:
+        logging.warning(
+            "Donations are not configured: set PSY_DONATE_URL and/or PSY_DONATE_TON_ADDRESS"
+        )
+    return settings
 
 
 def create_bot(settings: TelegramSettings) -> Bot:
@@ -261,23 +292,63 @@ def build_consent_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_donate_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text=DONATE_BUTTON_TEXT, url=DONATE_URL),
-        ]]
-    )
+def ton_transfer_url(address: str) -> str:
+    """Universal link Tonkeeper на перевод USD₮ в сети TON."""
+    return f'https://app.tonkeeper.com/transfer/{address}?jetton={TON_USDT_JETTON_MASTER}'
+
+
+def build_donate_rows() -> list[list[InlineKeyboardButton]]:
+    """Ряды кнопок донатов; пустой список, если реквизиты не заданы."""
+    buttons = []
+    if donate_settings.link_url:
+        buttons.append(
+            InlineKeyboardButton(text=DONATE_LINK_BUTTON_TEXT, url=donate_settings.link_url)
+        )
+    if donate_settings.ton_address:
+        buttons.append(
+            InlineKeyboardButton(
+                text=DONATE_TON_BUTTON_TEXT,
+                url=ton_transfer_url(donate_settings.ton_address),
+            )
+        )
+    return [buttons] if buttons else []
+
+
+def build_donate_keyboard() -> Optional[InlineKeyboardMarkup]:
+    rows = build_donate_rows()
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def build_donate_text() -> str:
+    text = DONATE_INTRO
+    if donate_settings.link_url:
+        text = f'{text}\n\nКартой или через СБП — по кнопке ниже.'
+    if donate_settings.ton_address:
+        text = (
+            f'{text}\n\nВ крипте — USD₮ или TON в сети TON:\n'
+            f'<code>{donate_settings.ton_address}</code>\n'
+            'Адрес копируется нажатием. Кнопка ниже открывает Tonkeeper с уже '
+            'выбранным USD₮; в других кошельках отправляйте на адрес вручную.'
+        )
+    return text
 
 
 async def send_donate_message(message: Message) -> None:
-    """Отправить баннер донатов с кнопкой; без картинки — только текст."""
+    """Отправить баннер донатов с кнопками; без картинки — только текст."""
     keyboard = build_donate_keyboard()
+    if not keyboard:
+        await message.answer(
+            'Донаты пока не настроены — спасибо за желание поддержать! 🙏'
+        )
+        return
+
+    donate_text = build_donate_text()
     if DONATE_BANNER.exists():
         try:
             await _run_with_retries(
                 lambda: message.answer_photo(
                     photo=FSInputFile(path=str(DONATE_BANNER)),
-                    caption=DONATE_TEXT,
+                    caption=donate_text,
                     parse_mode='HTML',
                     reply_markup=keyboard,
                 ),
@@ -289,7 +360,7 @@ async def send_donate_message(message: Message) -> None:
     else:
         logging.warning('Donate banner not found at %s', DONATE_BANNER)
 
-    await message.answer(DONATE_TEXT, parse_mode='HTML', reply_markup=keyboard)
+    await message.answer(donate_text, parse_mode='HTML', reply_markup=keyboard)
 
 
 def build_retry_keyboard() -> InlineKeyboardMarkup:
@@ -321,9 +392,7 @@ def build_retry_keyboard() -> InlineKeyboardMarkup:
                     callback_data='session:finish',
                 ),
             ],
-            [
-                InlineKeyboardButton(text=DONATE_BUTTON_TEXT, url=DONATE_URL),
-            ],
+            *build_donate_rows(),
         ]
     )
 
@@ -854,7 +923,9 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
 
 
 async def run_bot() -> None:
+    global donate_settings
     settings = load_settings()
+    donate_settings = load_donate_settings()
     ensure_temp_root()
     load_consents()
     logging.info("Starting Telegram bot polling")
