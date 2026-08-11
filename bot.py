@@ -43,9 +43,10 @@ TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
 
 PHOTO_CAPTION_LIMIT = 1024
-# Телеграм отдаёт длительность в секундах; часовая сессия — норма, шестичасовая — нет.
-MAX_AUDIO_DURATION_SECONDS = 4 * 60 * 60
-MAX_AUDIO_BYTES = 500 * 1024 * 1024
+# Сессия обычно 50-60 минут, полтора часа берёт и сдвоенные. Длительность приходит
+# только для voice/audio: у документа её нет, там ограничением работает размер.
+MAX_AUDIO_DURATION_SECONDS = 90 * 60
+MAX_AUDIO_BYTES = 200 * 1024 * 1024
 
 LOG_FILE = Path('logs/bot.log')
 LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -493,14 +494,16 @@ def check_media_limits(media: Any) -> Optional[str]:
     duration = getattr(media, 'duration', None)
     if isinstance(duration, int) and duration > MAX_AUDIO_DURATION_SECONDS:
         return (
-            f'Запись длиннее {MAX_AUDIO_DURATION_SECONDS // 3600} часов — '
-            'такую бот не потянет. Разрежьте её на части и пришлите по очереди 🙏'
+            f'Запись длиннее {MAX_AUDIO_DURATION_SECONDS // 60} минут '
+            f'({duration // 60} мин) — такую бот не потянет. '
+            'Разрежьте её на части и пришлите по очереди 🙏'
         )
     size = getattr(media, 'file_size', None)
     if isinstance(size, int) and size > MAX_AUDIO_BYTES:
         return (
-            f'Файл больше {MAX_AUDIO_BYTES // (1024 * 1024)} МБ. '
-            'Пришлите запись меньшего размера или сожмите её 🙏'
+            f'Файл больше {MAX_AUDIO_BYTES // (1024 * 1024)} МБ '
+            f'({size // (1024 * 1024)} МБ). Если это WAV с диктофона — '
+            'пересохраните в mp3 или m4a, звук для распознавания не пострадает 🙏'
         )
     return None
 
