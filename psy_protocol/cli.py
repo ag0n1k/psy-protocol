@@ -19,6 +19,7 @@ from .config import (
     DEFAULT_WORD_SMOOTH_MIN_WORDS,
     LOG_FORMAT,
 )
+from .dialogue_parser import parse_dialogue_text
 from .pipeline import ProcessingOptions, process_audio_file
 
 
@@ -467,38 +468,6 @@ def _run_align(args) -> None:
     logging.info('Alignment done: %d segments saved to %s', len(alignment.segments), cache_dir / 'alignment_result.json')
 
 
-def _parse_text_file(text: str) -> list:
-    """Parse text with lines like 'К: ...' / 'Т: ...' into replica dicts."""
-    import re
-    replicas = []
-    current_role = None
-    current_lines = []
-
-    for line in text.splitlines():
-        match = re.match(r'^([КТ]):\s*(.*)', line)
-        if match:
-            if current_role is not None and current_lines:
-                replicas.append({
-                    'role': current_role,
-                    'text': ' '.join(current_lines),
-                })
-            current_role = match.group(1)
-            first_text = match.group(2).strip()
-            current_lines = [first_text] if first_text else []
-        elif current_role is not None:
-            stripped = line.strip()
-            if stripped:
-                current_lines.append(stripped)
-
-    if current_role is not None and current_lines:
-        replicas.append({
-            'role': current_role,
-            'text': ' '.join(current_lines),
-        })
-
-    return replicas
-
-
 def _run_from_text(args) -> None:
     from .docx_writer import create_docx
 
@@ -508,7 +477,7 @@ def _run_from_text(args) -> None:
         return
 
     text = input_path.read_text(encoding='utf-8')
-    replicas = _parse_text_file(text)
+    replicas = parse_dialogue_text(text)
     if not replicas:
         logging.error('No replicas found in %s (expected lines like "К: ..." or "Т: ...")', input_path)
         return

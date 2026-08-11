@@ -24,7 +24,7 @@ from aiogram.types import (
     Message,
 )
 
-from psy_protocol.cli import _parse_text_file
+from psy_protocol.dialogue_parser import parse_dialogue_text
 from psy_protocol.config import LOG_FORMAT
 from psy_protocol.docx_writer import create_docx
 from psy_protocol.pipeline import ProcessingOptions, process_audio_file
@@ -41,6 +41,11 @@ from psy_protocol.usage_stats import (
 
 TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
+
+PHOTO_CAPTION_LIMIT = 1024
+# Телеграм отдаёт длительность в секундах; часовая сессия — норма, шестичасовая — нет.
+MAX_AUDIO_DURATION_SECONDS = 4 * 60 * 60
+MAX_AUDIO_BYTES = 500 * 1024 * 1024
 
 LOG_FILE = Path('logs/bot.log')
 LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -159,6 +164,18 @@ def save_consent(chat_id: int) -> None:
         f.write(f"{chat_id}\n")
 
 
+def revoke_consent(chat_id: int) -> None:
+    """Убрать chat_id из файла согласий, переписав его целиком."""
+    consented_users.discard(chat_id)
+    if not CONSENTS_FILE.exists():
+        return
+    kept = [
+        line for line in CONSENTS_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip() != str(chat_id)
+    ]
+    CONSENTS_FILE.write_text('\n'.join(kept) + ('\n' if kept else ''), encoding="utf-8")
+
+
 async def _run_with_retries(
     call: Callable[[], Awaitable[T]],
     operation: str,
@@ -225,9 +242,13 @@ def parse_env_file(path: Path) -> Dict[str, str]:
     return values
 
 
-def load_settings() -> TelegramSettings:
-    env_file_values = parse_env_file(Path(".env"))
-    env = {**env_file_values, **os.environ}
+def read_env() -> Dict[str, str]:
+    """Значения из .env, перекрытые переменными окружения."""
+    return {**parse_env_file(Path(".env")), **os.environ}
+
+
+def load_settings(env: Optional[Dict[str, str]] = None) -> TelegramSettings:
+    env = env if env is not None else read_env()
     token = env.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment or .env file")
@@ -250,8 +271,8 @@ def load_settings() -> TelegramSettings:
     )
 
 
-def load_admin_chat_ids() -> set[int]:
-    env = {**parse_env_file(Path(".env")), **os.environ}
+def load_admin_chat_ids(env: Optional[Dict[str, str]] = None) -> set[int]:
+    env = env if env is not None else read_env()
     raw = env.get("PSY_ADMIN_CHAT_IDS", "")
     ids = set()
     for chunk in raw.replace(";", ",").split(","):
@@ -267,8 +288,8 @@ def load_admin_chat_ids() -> set[int]:
     return ids
 
 
-def load_donate_settings() -> DonateSettings:
-    env = {**parse_env_file(Path(".env")), **os.environ}
+def load_donate_settings(env: Optional[Dict[str, str]] = None) -> DonateSettings:
+    env = env if env is not None else read_env()
     settings = DonateSettings(
         link_url=env.get("PSY_DONATE_URL") or None,
         ton_address=env.get("PSY_DONATE_TON_ADDRESS") or None,
@@ -395,20 +416,25 @@ async def send_donate_message(message: Message) -> None:
         return
 
     donate_text = build_donate_text()
+    # Подпись к фото ограничена 1024 символами, длинный текст уходит отдельным сообщением.
+    fits_in_caption = len(donate_text) <= PHOTO_CAPTION_LIMIT
     if DONATE_BANNER.exists():
         try:
             await _run_with_retries(
                 lambda: message.answer_photo(
                     photo=FSInputFile(path=str(DONATE_BANNER)),
-                    caption=donate_text,
+                    caption=donate_text if fits_in_caption else None,
                     parse_mode='HTML',
-                    reply_markup=keyboard,
+                    reply_markup=keyboard if fits_in_caption else None,
                 ),
                 operation='send donate banner',
             )
-            return
-        except TelegramNetworkError:
-            logging.warning('Failed to send donate banner, falling back to text')
+            if fits_in_caption:
+                return
+        except Exception:
+            # Не только сеть: битый файл или превышенный лимит дают TelegramBadRequest,
+            # и без этого фолбэка пользователь не получил бы вообще ничего.
+            logging.warning('Failed to send donate banner, falling back to text', exc_info=True)
     else:
         logging.warning('Donate banner not found at %s', DONATE_BANNER)
 
@@ -453,20 +479,35 @@ def ensure_temp_root() -> None:
     TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-def build_work_paths(message: Message, suffix: str) -> Tuple[Path, Path, Path]:
-    chat_id = message.chat.id if message.chat else 0
-    message_id = message.message_id
-    work_dir = TEMP_ROOT / f"{chat_id}_{message_id}"
+def build_work_paths(message: Message, suffix: str) -> Tuple[Path, Path, Path, Path]:
+    work_dir = TEMP_ROOT / f"{message.chat.id}_{message.message_id}"
     work_dir.mkdir(parents=True, exist_ok=True)
     audio_path = work_dir / f"input{suffix}"
     output_docx = work_dir / "result.docx"
     cache_dir = work_dir / "cache"
-    return work_dir, audio_path, output_docx
+    return work_dir, audio_path, output_docx, cache_dir
+
+
+def check_media_limits(media: Any) -> Optional[str]:
+    """Причина отказа, если файл слишком велик или длинен; None — можно брать."""
+    duration = getattr(media, 'duration', None)
+    if isinstance(duration, int) and duration > MAX_AUDIO_DURATION_SECONDS:
+        return (
+            f'Запись длиннее {MAX_AUDIO_DURATION_SECONDS // 3600} часов — '
+            'такую бот не потянет. Разрежьте её на части и пришлите по очереди 🙏'
+        )
+    size = getattr(media, 'file_size', None)
+    if isinstance(size, int) and size > MAX_AUDIO_BYTES:
+        return (
+            f'Файл больше {MAX_AUDIO_BYTES // (1024 * 1024)} МБ. '
+            'Пришлите запись меньшего размера или сожмите её 🙏'
+        )
+    return None
 
 
 async def download_audio(
     message: Message, bot: Bot, settings: TelegramSettings,
-) -> Optional[Tuple[Path, Path, Path]]:
+) -> Optional[Tuple[Path, Path, Path, Path]]:
     file_id: Optional[str] = None
     suffix = ".audio"
 
@@ -496,11 +537,11 @@ async def download_audio(
         media_kind, media_size, file_id,
     )
 
-    work_dir, audio_path, output_docx = build_work_paths(message, suffix)
+    work_dir, audio_path, output_docx, cache_dir = build_work_paths(message, suffix)
     tg_file = await bot.get_file(file_id)
     file_path = tg_file.file_path or ""
     await bot.download_file(file_path, destination=audio_path)
-    return work_dir, audio_path, output_docx
+    return work_dir, audio_path, output_docx, cache_dir
 
 
 def cleanup_work_dir(path: Path) -> None:
@@ -614,18 +655,20 @@ def build_bar(percent: float) -> str:
     return f"{'█' * filled}{'░' * (10 - filled)}"
 
 
+STAGE_LABELS = {
+    "queue": "Ожидание в очереди",
+    "start": "Идёт обработка аудио",
+    "prepare": "Идёт обработка аудио",
+    "whisper": "Идёт обработка аудио",
+    "diarization": "Идёт обработка аудио",
+    "replicas": "Идёт обработка аудио",
+    "output": "Идёт обработка аудио",
+    "done": "Готово",
+}
+
+
 def stage_label(stage: str) -> str:
-    labels = {
-        "queue": "Ожидание в очереди",
-        "start": "Идёт обработка аудио",
-        "prepare": "Идёт обработка аудио",
-        "whisper": "Идёт обработка аудио",
-        "diarization": "Идёт обработка аудио",
-        "replicas": "Идёт обработка аудио",
-        "output": "Идёт обработка аудио",
-        "done": "Готово",
-    }
-    return labels.get(stage, stage.title())
+    return STAGE_LABELS.get(stage, stage.title())
 
 
 def render_queue_text(ticket: Optional[QueueTicket]) -> str:
@@ -667,6 +710,7 @@ async def progress_updater(
     status_message: Message, progress: Dict[str, Any], interval_seconds: int = 5,
 ) -> None:
     last_text = ""
+    finished: Optional[asyncio.Event] = progress.get("finished")
     while not progress.get("done"):
         text = render_progress_text(progress)
         if text != last_text:
@@ -675,7 +719,14 @@ async def progress_updater(
                 last_text = text
             except Exception:
                 logging.debug("Status message edit skipped", exc_info=True)
-        await asyncio.sleep(interval_seconds)
+        if finished is None:
+            await asyncio.sleep(interval_seconds)
+            continue
+        try:
+            # Просыпаемся сразу по завершении, иначе результат ждёт конца интервала.
+            await asyncio.wait_for(finished.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            pass
 
     final_text = render_progress_text(progress)
     if final_text != last_text:
@@ -693,16 +744,20 @@ async def run_pipeline_and_send(
     reply_target: Message,
     progress: Dict[str, Any],
     source: str = 'audio',
+    ticket: Optional[QueueTicket] = None,
 ) -> bool:
     """Run the pipeline and send result files. Returns True on success."""
     updater_task = asyncio.create_task(
         progress_updater(status_message, progress, interval_seconds=5)
     )
-    ticket = enqueue_ticket(chat_id)
+    if ticket is None:
+        ticket = enqueue_ticket(chat_id)
     started_at = time.monotonic()
     try:
-        if PIPELINE_SEMAPHORE.locked():
-            progress["ticket"] = ticket
+        progress["ticket"] = ticket
+        # Проверка стоит вплотную к acquire: между ними нет ни одного await,
+        # поэтому увиденное состояние семафора не успевает устареть.
+        if PIPELINE_SEMAPHORE.locked() or queue_position(ticket) > 1:
             _update_progress(progress, "queue", 0.0, "Waiting in processing queue", chat_id)
 
         async with PIPELINE_SEMAPHORE:
@@ -711,8 +766,7 @@ async def run_pipeline_and_send(
             docx_path, txt_path = await asyncio.to_thread(
                 process_audio_file, audio_path, opts, lambda s, p, m: _update_progress(progress, s, p, m, chat_id)
             )
-        progress["done"] = True
-        progress["success"] = True
+        _finish_progress(progress, success=True)
         await updater_task
         await _run_with_retries(
             lambda: reply_target.answer_document(FSInputFile(path=str(txt_path))),
@@ -735,8 +789,7 @@ async def run_pipeline_and_send(
         )
         return True
     except Exception:
-        progress["done"] = True
-        progress["success"] = False
+        _finish_progress(progress, success=False)
         record_event(
             EVENT_PROCESSED, chat_id, ok=False, source=source,
             duration_sec=round(time.monotonic() - started_at, 1),
@@ -751,6 +804,14 @@ async def run_pipeline_and_send(
         release_ticket(ticket)
         if not updater_task.done():
             updater_task.cancel()
+
+
+def _finish_progress(progress: Dict[str, Any], success: bool) -> None:
+    progress["done"] = True
+    progress["success"] = success
+    finished = progress.get("finished")
+    if finished is not None:
+        finished.set()
 
 
 def _update_progress(
@@ -780,6 +841,7 @@ def _update_progress(
 def _make_progress() -> Dict[str, Any]:
     now = time.monotonic()
     return {
+        "finished": asyncio.Event(),
         "done": False,
         "success": False,
         "stage": "start",
@@ -791,9 +853,23 @@ def _make_progress() -> Dict[str, Any]:
     }
 
 
+def read_text_file(path: Path) -> Optional[str]:
+    """Прочитать .txt: из Word на Windows такие файлы приходят в cp1251, а не в UTF-8."""
+    for encoding in ('utf-8', 'utf-8-sig', 'cp1251'):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            logging.exception('Failed to read text file %s', path)
+            return None
+    logging.warning('Unsupported encoding for text file %s', path)
+    return None
+
+
 async def process_text_file_and_reply(message: Message, bot: Bot) -> None:
     """Download a text document, parse К:/Т: replicas, generate and send DOCX."""
-    chat_id = message.chat.id if message.chat else 0
+    chat_id = message.chat.id
     if chat_id not in consented_users:
         await message.answer(
             CONSENT_TEXT,
@@ -811,8 +887,16 @@ async def process_text_file_and_reply(message: Message, bot: Bot) -> None:
     tg_file = await bot.get_file(file_id)
     await bot.download_file(tg_file.file_path or '', destination=input_path)
 
-    text = input_path.read_text(encoding='utf-8')
-    replicas = _parse_text_file(text)
+    text = read_text_file(input_path)
+    if text is None:
+        await message.answer(
+            'Не удалось прочитать файл: ожидается текст в кодировке UTF-8 или Windows-1251. '
+            'Пересохраните файл в UTF-8 и пришлите снова 🙏'
+        )
+        cleanup_work_dir(work_dir)
+        return
+
+    replicas = parse_dialogue_text(text)
     if not replicas:
         await message.answer(
             'Не удалось найти реплики в файле. '
@@ -850,7 +934,7 @@ async def process_text_file_and_reply(message: Message, bot: Bot) -> None:
 
 
 async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettings) -> None:
-    chat_id = message.chat.id if message.chat else 0
+    chat_id = message.chat.id
     if chat_id not in consented_users:
         await message.answer(
             CONSENT_TEXT,
@@ -871,6 +955,13 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             "Сейчас очередь заполнена: бот обрабатывает файлы по одному, "
             f"и в ожидании уже {len(pipeline_queue)}. Попробуйте отправить запись чуть позже 🙏"
         )
+        return
+
+    media = message.voice or message.audio or message.document
+    limit_error = check_media_limits(media) if media else None
+    if limit_error:
+        record_event(EVENT_REJECTED, chat_id, reason='too_large')
+        await message.answer(limit_error)
         return
 
     active_session = job_sessions.get(chat_id)
@@ -894,7 +985,10 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             return
 
     processing_chats.add(chat_id)
-    download_result: Optional[Tuple[Path, Path, Path]] = None
+    # Тикет берём до скачивания: иначе между проверкой очереди и постановкой в неё
+    # проходят минуты закачки, и одновременные отправки пробивают лимит.
+    ticket = enqueue_ticket(chat_id)
+    download_result: Optional[Tuple[Path, Path, Path, Path]] = None
     try:
         download_result = await download_audio(message, bot, settings)
         if not download_result:
@@ -903,7 +997,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             )
             return
 
-        work_dir, audio_path, output_docx = download_result
+        work_dir, audio_path, output_docx, cache_dir = download_result
         active_work_dirs.add(work_dir)
         if PIPELINE_SEMAPHORE.locked():
             initial_status = (
@@ -919,7 +1013,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             lambda: message.answer(initial_status),
             operation='send initial status',
         )
-        options = build_processing_options(settings, output_docx=output_docx, cache_dir=work_dir / "cache")
+        options = build_processing_options(settings, output_docx=output_docx, cache_dir=cache_dir)
         progress = _make_progress()
 
         success = await run_pipeline_and_send(
@@ -930,6 +1024,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             reply_target=message,
             progress=progress,
             source='voice' if message.voice else 'audio',
+            ticket=ticket,
         )
 
         if success:
@@ -952,6 +1047,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             )
             cleanup_work_dir(work_dir)
     finally:
+        release_ticket(ticket)
         processing_chats.discard(chat_id)
         if download_result:
             active_work_dirs.discard(download_result[0])
@@ -967,29 +1063,38 @@ async def handle_retry_callback(
         )
     except TelegramNetworkError:
         logging.warning('Telegram timeout while acknowledging retry callback')
-    preset_key = (callback.data or "").split(":", 1)[1]
-    chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
+
+    # Telegram не присылает message для кнопок старше 48 часов, а они живут в чате вечно.
+    if not callback.message:
+        logging.info('Retry callback without message (too old), ignoring')
+        return
+
+    data = callback.data or ''
+    preset_key = data.split(':', 1)[1] if ':' in data else ''
+    if preset_key not in PRESETS:
+        logging.warning('Unknown retry preset in callback data: %r', data)
+        await callback.message.answer('Неизвестное действие, отправьте аудио заново.')
+        return
+
+    chat_id = callback.message.chat.id
 
     if chat_id in processing_chats:
-        if callback.message:
-            await callback.message.answer('Обработка уже выполняется. Дождитесь завершения.')
+        await callback.message.answer('Обработка уже выполняется. Дождитесь завершения.')
         return
 
     if queue_is_full():
-        if callback.message:
-            await callback.message.answer(
-                'Сейчас очередь заполнена, попробуйте повторить обработку чуть позже 🙏'
-            )
+        record_event(EVENT_REJECTED, chat_id, reason='queue_full')
+        await callback.message.answer(
+            'Сейчас очередь заполнена, попробуйте повторить обработку чуть позже 🙏'
+        )
         return
 
     session = job_sessions.get(chat_id)
     if not session:
-        if callback.message:
-            await callback.message.answer("Активный файл не найден, отправьте аудио заново.")
+        await callback.message.answer("Активный файл не найден, отправьте аудио заново.")
         return
     if not session.audio_path.exists():
-        if callback.message:
-            await callback.message.answer('Исходный аудиофайл недоступен, отправьте аудио заново.')
+        await callback.message.answer('Исходный аудиофайл недоступен, отправьте аудио заново.')
         cleanup_work_dir(session.work_dir)
         job_sessions.pop(chat_id, None)
         return
@@ -1049,27 +1154,69 @@ async def handle_finish_callback(callback: CallbackQuery) -> None:
         )
     except TelegramNetworkError:
         logging.warning('Telegram timeout while acknowledging finish callback')
-    chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
+
+    if not callback.message:
+        logging.info('Finish callback without message (too old), ignoring')
+        return
+    chat_id = callback.message.chat.id
 
     # Кнопка живёт в истории чата вечно: без этой проверки нажатие под старым
     # результатом снесёт каталог задачи, которая сейчас в очереди или в работе.
     if chat_id in processing_chats:
-        if callback.message:
-            await callback.message.answer(
-                'Сейчас идёт обработка файла — дождитесь её завершения.'
-            )
+        await callback.message.answer(
+            'Сейчас идёт обработка файла — дождитесь её завершения.'
+        )
         return
 
     session = job_sessions.pop(chat_id, None)
     if not session:
-        if callback.message:
-            await callback.message.answer('Нет активной обработки. Можете отправить новый файл.')
+        await callback.message.answer('Нет активной обработки. Можете отправить новый файл.')
         return
 
     cleanup_work_dir(session.work_dir)
     logging.info('Session finished and cleaned for chat_id=%s', chat_id)
-    if callback.message:
-        await callback.message.answer('Обработка завершена, кэш очищен. Отправьте новый файл.')
+    await callback.message.answer('Обработка завершена, кэш очищен. Отправьте новый файл.')
+
+
+def build_forget_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text='🗑 Да, удалить', callback_data='forget:confirm'),
+        ]]
+    )
+
+
+async def handle_forget_callback(callback: CallbackQuery) -> None:
+    try:
+        await _run_with_retries(
+            lambda: callback.answer(),
+            operation='ack forget callback',
+        )
+    except TelegramNetworkError:
+        logging.warning('Telegram timeout while acknowledging forget callback')
+
+    if not callback.message:
+        logging.info('Forget callback without message (too old), ignoring')
+        return
+    chat_id = callback.message.chat.id
+
+    if chat_id in processing_chats:
+        await callback.message.answer(
+            'Сейчас идёт обработка вашего файла — дождитесь её завершения и повторите /forget.'
+        )
+        return
+
+    session = job_sessions.pop(chat_id, None)
+    if session:
+        cleanup_work_dir(session.work_dir)
+    revoke_consent(chat_id)
+    logging.info('Data removed and consent revoked for chat_id=%s', chat_id)
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        '🗑 Готово. Аудио и результаты удалены, согласие отозвано.\n\n'
+        'Чтобы снова пользоваться ботом, отправьте /start и примите соглашение.'
+    )
 
 
 async def handle_consent_callback(callback: CallbackQuery) -> None:
@@ -1080,17 +1227,21 @@ async def handle_consent_callback(callback: CallbackQuery) -> None:
         )
     except TelegramNetworkError:
         logging.warning('Telegram timeout while acknowledging consent callback')
-    chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
+
+    if not callback.message:
+        logging.info('Consent callback without message (too old), ignoring')
+        return
+    chat_id = callback.message.chat.id
+
     if chat_id not in consented_users:
         consented_users.add(chat_id)
         save_consent(chat_id)
         record_event(EVENT_CONSENT, chat_id)
         logging.info("Consent accepted for chat_id=%s", chat_id)
-    if callback.message:
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.answer(
-            "✅ Соглашение принято. Отправьте голосовое сообщение или аудиофайл 📄"
-        )
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        "✅ Соглашение принято. Отправьте голосовое сообщение или аудиофайл 📄"
+    )
 
 
 def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
@@ -1098,7 +1249,7 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
 
     @dp.message(CommandStart())
     async def handle_start(message: Message) -> None:
-        chat_id = message.chat.id if message.chat else 0
+        chat_id = message.chat.id
         if chat_id in consented_users:
             await message.answer(
                 "Здравствуйте! 👋 Вы уже приняли соглашение.\n"
@@ -1116,9 +1267,20 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
     async def handle_donate(message: Message) -> None:
         await send_donate_message(message)
 
+    @dp.message(Command('forget'))
+    async def handle_forget(message: Message) -> None:
+        await message.answer(
+            '🗑 <b>Удаление данных</b>\n\n'
+            'Будут удалены загруженное аудио и результаты обработки, '
+            'а согласие с пользовательским соглашением отозвано.\n\n'
+            'Обезличенная статистика использования (без вашего id) сохраняется.',
+            parse_mode='HTML',
+            reply_markup=build_forget_keyboard(),
+        )
+
     @dp.message(Command('stats'))
     async def handle_stats(message: Message) -> None:
-        chat_id = message.chat.id if message.chat else 0
+        chat_id = message.chat.id
         if chat_id not in admin_chat_ids:
             # Для остальных команда как будто не существует — обычное приветствие.
             await handle_start(message)
@@ -1129,6 +1291,10 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
     @dp.callback_query(F.data == "consent:accept")
     async def handle_consent(callback: CallbackQuery) -> None:
         await handle_consent_callback(callback)
+
+    @dp.callback_query(F.data == "forget:confirm")
+    async def handle_forget_confirm(callback: CallbackQuery) -> None:
+        await handle_forget_callback(callback)
 
     @dp.message(F.voice)
     async def handle_voice(message: Message, bot: Bot) -> None:
@@ -1165,9 +1331,10 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
 
 async def run_bot() -> None:
     global donate_settings, admin_chat_ids
-    settings = load_settings()
-    donate_settings = load_donate_settings()
-    admin_chat_ids = load_admin_chat_ids()
+    env = read_env()
+    settings = load_settings(env)
+    donate_settings = load_donate_settings(env)
+    admin_chat_ids = load_admin_chat_ids(env)
     ensure_temp_root()
     purge_temp_root()
     load_consents()
@@ -1180,6 +1347,7 @@ async def run_bot() -> None:
             await bot.set_my_commands([
                 BotCommand(command='start', description='Начать работу'),
                 BotCommand(command='donate', description='Поддержать проект ☕️'),
+                BotCommand(command='forget', description='Удалить мои данные'),
             ])
         except Exception:
             # Меню команд не критично: без него бот работает, а падение здесь
