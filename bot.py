@@ -444,16 +444,6 @@ async def download_audio(
         file_id = message.audio.file_id
         if message.audio.file_name:
             suffix = Path(message.audio.file_name).suffix or ".audio"
-    elif message.video_note:
-        # Кружок — mp4 со звуковой дорожкой, ffmpeg на стадии preprocess её вытащит.
-        file_id = message.video_note.file_id
-        suffix = ".mp4"
-    elif message.video:
-        file_id = message.video.file_id
-        if message.video.file_name:
-            suffix = Path(message.video.file_name).suffix or ".mp4"
-        else:
-            suffix = ".mp4"
     elif message.document:
         mime_type = message.document.mime_type or ""
         if not mime_type.startswith(SUPPORTED_AUDIO_MIME_PREFIX):
@@ -465,10 +455,7 @@ async def download_audio(
     if not file_id:
         return None
 
-    media = (
-        message.voice or message.audio or message.video_note
-        or message.video or message.document
-    )
+    media = message.voice or message.audio or message.document
     media_size = getattr(media, "file_size", None) if media else None
     media_kind = type(media).__name__ if media else "unknown"
     logging.info(
@@ -1091,14 +1078,6 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
 
     @dp.message(F.audio)
     async def handle_audio(message: Message, bot: Bot) -> None:
-        await process_and_reply(message, bot, settings)
-
-    @dp.message(F.video_note)
-    async def handle_video_note(message: Message, bot: Bot) -> None:
-        await process_and_reply(message, bot, settings)
-
-    @dp.message(F.video)
-    async def handle_video(message: Message, bot: Bot) -> None:
         await process_and_reply(message, bot, settings)
 
     @dp.message(F.document)
