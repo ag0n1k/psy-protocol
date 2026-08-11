@@ -102,17 +102,24 @@ class QueueTicket:
 class JobSession:
     work_dir: Path
     audio_path: Path
-    base_options: Any  # ProcessingOptions — imported below
+    base_options: ProcessingOptions
+    created_at: float
 
 
 # Keyed by chat_id (int)
 job_sessions: Dict[int, "JobSession"] = {}
 processing_chats: set[int] = set()
+# Каталоги задач, которые прямо сейчас в очереди или в обработке: уборщик их не трогает.
+active_work_dirs: set[Path] = set()
 PIPELINE_SEMAPHORE = asyncio.Semaphore(1)
 
 # Сколько задач может ждать своей очереди, не считая той, что обрабатывается сейчас.
 MAX_QUEUE_LENGTH = 5
 pipeline_queue: "list[QueueTicket]" = []
+
+# Соглашение обещает удаление аудио и результатов через час — этот срок и выдерживаем.
+SESSION_TTL_SECONDS = 3600
+CLEANUP_INTERVAL_SECONDS = 300
 
 CONSENTS_FILE = Path("consents/accepted.txt")
 consented_users: set[int] = set()
@@ -437,6 +444,16 @@ async def download_audio(
         file_id = message.audio.file_id
         if message.audio.file_name:
             suffix = Path(message.audio.file_name).suffix or ".audio"
+    elif message.video_note:
+        # Кружок — mp4 со звуковой дорожкой, ffmpeg на стадии preprocess её вытащит.
+        file_id = message.video_note.file_id
+        suffix = ".mp4"
+    elif message.video:
+        file_id = message.video.file_id
+        if message.video.file_name:
+            suffix = Path(message.video.file_name).suffix or ".mp4"
+        else:
+            suffix = ".mp4"
     elif message.document:
         mime_type = message.document.mime_type or ""
         if not mime_type.startswith(SUPPORTED_AUDIO_MIME_PREFIX):
@@ -448,7 +465,10 @@ async def download_audio(
     if not file_id:
         return None
 
-    media = message.voice or message.audio or message.document
+    media = (
+        message.voice or message.audio or message.video_note
+        or message.video or message.document
+    )
     media_size = getattr(media, "file_size", None) if media else None
     media_kind = type(media).__name__ if media else "unknown"
     logging.info(
@@ -466,6 +486,75 @@ async def download_audio(
 def cleanup_work_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
+
+
+def tree_mtime(path: Path) -> float:
+    """Самое свежее время изменения в поддереве — каталог кэша обновляется, а сам work_dir нет."""
+    latest = path.stat().st_mtime
+    for child in path.rglob('*'):
+        try:
+            latest = max(latest, child.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
+
+
+def purge_temp_root() -> None:
+    """Снести всё временное при старте: после рестарта активных задач заведомо нет."""
+    if not TEMP_ROOT.exists():
+        return
+    removed = 0
+    for child in TEMP_ROOT.iterdir():
+        if child.is_dir():
+            cleanup_work_dir(child)
+            removed += 1
+    if removed:
+        logging.info("Purged %d stale work dirs at startup", removed)
+
+
+def cleanup_expired_data() -> int:
+    """Удалить аудио и результаты старше SESSION_TTL_SECONDS. Возвращает число каталогов."""
+    now = time.time()
+    removed = 0
+
+    for chat_id, session in list(job_sessions.items()):
+        if session.work_dir in active_work_dirs:
+            continue
+        if now - session.created_at < SESSION_TTL_SECONDS:
+            continue
+        cleanup_work_dir(session.work_dir)
+        job_sessions.pop(chat_id, None)
+        removed += 1
+        logging.info("Session data expired and removed for chat_id=%s", chat_id)
+
+    # Каталоги без сессии: остались от упавших задач или от прошлых запусков.
+    known_dirs = {session.work_dir for session in job_sessions.values()} | active_work_dirs
+    if TEMP_ROOT.exists():
+        for child in TEMP_ROOT.iterdir():
+            if not child.is_dir() or child in known_dirs:
+                continue
+            try:
+                if now - tree_mtime(child) < SESSION_TTL_SECONDS:
+                    continue
+            except OSError:
+                continue
+            cleanup_work_dir(child)
+            removed += 1
+            logging.info("Orphaned work dir expired and removed: %s", child)
+
+    return removed
+
+
+async def cleanup_worker() -> None:
+    """Фоновая уборка временных данных по TTL."""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            removed = await asyncio.to_thread(cleanup_expired_data)
+            if removed:
+                logging.info("Cleanup removed %d expired work dirs", removed)
+        except Exception:
+            logging.exception("Cleanup iteration failed")
 
 
 def queue_is_full() -> bool:
@@ -773,6 +862,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             return
 
     processing_chats.add(chat_id)
+    download_result: Optional[Tuple[Path, Path, Path]] = None
     try:
         download_result = await download_audio(message, bot, settings)
         if not download_result:
@@ -782,6 +872,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             return
 
         work_dir, audio_path, output_docx = download_result
+        active_work_dirs.add(work_dir)
         if PIPELINE_SEMAPHORE.locked():
             initial_status = (
                 "Спасибо! 😊 Аудио получено и поставлено в очередь: "
@@ -809,10 +900,15 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
         )
 
         if success:
+            previous = job_sessions.get(chat_id)
+            if previous and previous.work_dir != work_dir:
+                # Иначе каталог прошлой сессии остаётся без ссылок и переживёт TTL-уборку.
+                cleanup_work_dir(previous.work_dir)
             job_sessions[chat_id] = JobSession(
                 work_dir=work_dir,
                 audio_path=audio_path,
                 base_options=options,
+                created_at=time.time(),
             )
             logging.info("Active file session stored for chat_id=%s", chat_id)
         else:
@@ -824,6 +920,8 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             cleanup_work_dir(work_dir)
     finally:
         processing_chats.discard(chat_id)
+        if download_result:
+            active_work_dirs.discard(download_result[0])
 
 
 async def handle_retry_callback(
@@ -888,6 +986,7 @@ async def handle_retry_callback(
     )
     progress = _make_progress()
     processing_chats.add(chat_id)
+    active_work_dirs.add(session.work_dir)
     try:
         success = await run_pipeline_and_send(
             chat_id=chat_id,
@@ -899,6 +998,7 @@ async def handle_retry_callback(
         )
     finally:
         processing_chats.discard(chat_id)
+        active_work_dirs.discard(session.work_dir)
 
     if not success:
         logging.error("Failed to retry audio processing for chat_id=%s preset=%s", chat_id, preset_key)
@@ -916,6 +1016,16 @@ async def handle_finish_callback(callback: CallbackQuery) -> None:
     except TelegramNetworkError:
         logging.warning('Telegram timeout while acknowledging finish callback')
     chat_id = callback.message.chat.id if callback.message and callback.message.chat else 0
+
+    # Кнопка живёт в истории чата вечно: без этой проверки нажатие под старым
+    # результатом снесёт каталог задачи, которая сейчас в очереди или в работе.
+    if chat_id in processing_chats:
+        if callback.message:
+            await callback.message.answer(
+                'Сейчас идёт обработка файла — дождитесь её завершения.'
+            )
+        return
+
     session = job_sessions.pop(chat_id, None)
     if not session:
         if callback.message:
@@ -983,6 +1093,14 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
     async def handle_audio(message: Message, bot: Bot) -> None:
         await process_and_reply(message, bot, settings)
 
+    @dp.message(F.video_note)
+    async def handle_video_note(message: Message, bot: Bot) -> None:
+        await process_and_reply(message, bot, settings)
+
+    @dp.message(F.video)
+    async def handle_video(message: Message, bot: Bot) -> None:
+        await process_and_reply(message, bot, settings)
+
     @dp.message(F.document)
     async def handle_document(message: Message, bot: Bot) -> None:
         mime = message.document.mime_type or '' if message.document else ''
@@ -1013,17 +1131,25 @@ async def run_bot() -> None:
     settings = load_settings()
     donate_settings = load_donate_settings()
     ensure_temp_root()
+    purge_temp_root()
     load_consents()
     logging.info("Starting Telegram bot polling")
     bot = create_bot(settings)
     dp = create_dispatcher(settings)
+    cleanup_task = asyncio.create_task(cleanup_worker())
     try:
-        await bot.set_my_commands([
-            BotCommand(command='start', description='Начать работу'),
-            BotCommand(command='donate', description='Поддержать проект ☕️'),
-        ])
+        try:
+            await bot.set_my_commands([
+                BotCommand(command='start', description='Начать работу'),
+                BotCommand(command='donate', description='Поддержать проект ☕️'),
+            ])
+        except Exception:
+            # Меню команд не критично: без него бот работает, а падение здесь
+            # раньше роняло процесс на каждом старте при недоступном Bot API.
+            logging.warning('Failed to publish bot commands, continuing', exc_info=True)
         await dp.start_polling(bot)
     finally:
+        cleanup_task.cancel()
         await bot.session.close()
 
 
