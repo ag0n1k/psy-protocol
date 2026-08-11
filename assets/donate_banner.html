@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<style>
+  @page { size: 480px 220px; margin: 0; }
+  html, body { margin: 0; padding: 0; width: 480px; height: 220px; }
+  body {
+    background: linear-gradient(115deg, #3d2618 0%, #26170f 58%, #14100e 100%);
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    color: #f5e9dc;
+    position: relative;
+    overflow: hidden;
+  }
+  .glow {
+    position: absolute;
+    left: -70px; top: -50px;
+    width: 320px; height: 320px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(214, 158, 92, 0.28) 0%, rgba(214, 158, 92, 0) 70%);
+  }
+  .wrap {
+    position: relative;
+    height: 220px;
+    box-sizing: border-box;
+    padding: 26px 30px 26px 26px;
+  }
+  .art {
+    float: left;
+    width: 168px;
+    padding-top: 4px;
+  }
+  .body-col {
+    margin-left: 186px;
+  }
+  .kicker {
+    font-size: 9.5px;
+    letter-spacing: 2.6px;
+    text-transform: uppercase;
+    color: #c79a63;
+    margin: 2px 0 9px 0;
+  }
+  h1 {
+    font-size: 30px;
+    line-height: 1.1;
+    font-weight: 700;
+    margin: 0 0 10px 0;
+    color: #fdf6ee;
+  }
+  .sub {
+    font-size: 12px;
+    line-height: 1.5;
+    color: #b9a692;
+    margin: 0 0 18px 0;
+  }
+  .cta {
+    display: inline-block;
+    padding: 9px 22px;
+    border-radius: 20px;
+    background: linear-gradient(180deg, #f0c274 0%, #d99b40 100%);
+    color: #2b1a0d;
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+  }
+  .foot {
+    position: absolute;
+    right: 30px; bottom: 18px;
+    font-size: 8.5px;
+    letter-spacing: 1.6px;
+    text-transform: uppercase;
+    color: #6f5f4e;
+  }
+</style>
+</head>
+<body>
+<div class="glow"></div>
+<div class="wrap">
+  <div class="art">
+    <svg width="168" height="168" viewBox="0 0 176 176" xmlns="http://www.w3.org/2000/svg">
+      <!-- пар -->
+      <g stroke="#c79a63" stroke-width="3.4" stroke-linecap="round" fill="none" opacity="0.55">
+        <path d="M62 46 C54 36, 70 30, 62 20"/>
+        <path d="M80 42 C72 30, 88 23, 80 11"/>
+        <path d="M98 46 C90 36, 106 30, 98 20"/>
+      </g>
+      <!-- блюдце -->
+      <ellipse cx="84" cy="152" rx="64" ry="10.5" fill="#1b1310"/>
+      <ellipse cx="84" cy="149" rx="64" ry="10.5" fill="#8a6a49"/>
+      <!-- ручка -->
+      <path d="M124 86 C150 86, 150 118, 124 118" stroke="#e0b478" stroke-width="9"
+            fill="none" stroke-linecap="round"/>
+      <!-- чашка -->
+      <path d="M28 70 H124 V114 C124 134, 106 144, 84 144 C62 144, 44 134, 44 114 Z"
+            fill="#f2e4d3"/>
+      <path d="M28 70 H124 V82 C124 92, 104 98, 76 98 C52 98, 34 92, 28 82 Z"
+            fill="#e6d3bd"/>
+      <!-- поверхность кофе -->
+      <ellipse cx="76" cy="74" rx="47" ry="11" fill="#4a2b16"/>
+      <ellipse cx="76" cy="73" rx="40" ry="8.5" fill="#6b3c1d"/>
+      <ellipse cx="66" cy="71" rx="12" ry="3.6" fill="#8d5a30" opacity="0.75"/>
+      <!-- звёзды -->
+      <path d="M152 16 l4.8 10.2 11.1 1.4 -8.1 7.9 2 11.1 -9.8 -5.4 -9.8 5.4
+               2 -11.1 -8.1 -7.9 11.1 -1.4 Z" fill="#f0c274"/>
+      <path d="M30 34 l2.7 5.8 6.3 0.8 -4.6 4.5 1.2 6.3 -5.6 -3.1 -5.6 3.1
+               1.2 -6.3 -4.6 -4.5 6.3 -0.8 Z" fill="#f0c274" opacity="0.4"/>
+    </svg>
+  </div>
+
+  <div class="body-col">
+    <p class="kicker">Спасибо, что рядом</p>
+    <h1>Кофе для бота</h1>
+    <p class="sub">Транскрипции живут на электричестве<br>и немного на кофеине</p>
+    <span class="cta">Поддержать проект</span>
+  </div>
+
+  <div class="foot">Psy Protocol</div>
+</div>
+</body>
+</html>

@@ -13,8 +13,9 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import SimpleFilesPathWrapper, TelegramAPIServer
 from aiogram.exceptions import TelegramNetworkError
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -30,6 +31,18 @@ from psy_protocol.pipeline import ProcessingOptions, process_audio_file
 
 TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
+
+DONATE_URL = 'https://pay.cloudtips.ru/p/85d6f45a'
+DONATE_BANNER = Path('assets/donate_banner.png')
+DONATE_BUTTON_TEXT = '☕️ Купить кофе'
+DONATE_TEXT = (
+    '☕️ <b>Кофе для бота</b>\n\n'
+    'Бот работает на домашней машине: транскрипции считаются локально, '
+    'без облаков и подписок. Если он сэкономил вам час рутины — '
+    'можно поддержать проект на кофе и электричество.\n\n'
+    'Любая сумма по желанию, оплата картой или СБП. Это не влияет '
+    'на работу бота: всё бесплатно и остаётся бесплатным.'
+)
 
 PRESETS: Dict[str, Dict[str, Any]] = {
     "other_approach": {
@@ -248,6 +261,37 @@ def build_consent_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def build_donate_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=DONATE_BUTTON_TEXT, url=DONATE_URL),
+        ]]
+    )
+
+
+async def send_donate_message(message: Message) -> None:
+    """Отправить баннер донатов с кнопкой; без картинки — только текст."""
+    keyboard = build_donate_keyboard()
+    if DONATE_BANNER.exists():
+        try:
+            await _run_with_retries(
+                lambda: message.answer_photo(
+                    photo=FSInputFile(path=str(DONATE_BANNER)),
+                    caption=DONATE_TEXT,
+                    parse_mode='HTML',
+                    reply_markup=keyboard,
+                ),
+                operation='send donate banner',
+            )
+            return
+        except TelegramNetworkError:
+            logging.warning('Failed to send donate banner, falling back to text')
+    else:
+        logging.warning('Donate banner not found at %s', DONATE_BANNER)
+
+    await message.answer(DONATE_TEXT, parse_mode='HTML', reply_markup=keyboard)
+
+
 def build_retry_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -276,6 +320,9 @@ def build_retry_keyboard() -> InlineKeyboardMarkup:
                     text='✅ Завершить обработку',
                     callback_data='session:finish',
                 ),
+            ],
+            [
+                InlineKeyboardButton(text=DONATE_BUTTON_TEXT, url=DONATE_URL),
             ],
         ]
     )
@@ -755,7 +802,8 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
         if chat_id in consented_users:
             await message.answer(
                 "Здравствуйте! 👋 Вы уже приняли соглашение.\n"
-                "Отправьте голосовое сообщение или аудиофайл 📄"
+                "Отправьте голосовое сообщение или аудиофайл 📄\n\n"
+                "Поддержать проект: /donate ☕️"
             )
         else:
             await message.answer(
@@ -763,6 +811,10 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
                 parse_mode="HTML",
                 reply_markup=build_consent_keyboard(),
             )
+
+    @dp.message(Command('donate'))
+    async def handle_donate(message: Message) -> None:
+        await send_donate_message(message)
 
     @dp.callback_query(F.data == "consent:accept")
     async def handle_consent(callback: CallbackQuery) -> None:
@@ -809,6 +861,10 @@ async def run_bot() -> None:
     bot = create_bot(settings)
     dp = create_dispatcher(settings)
     try:
+        await bot.set_my_commands([
+            BotCommand(command='start', description='Начать работу'),
+            BotCommand(command='donate', description='Поддержать проект ☕️'),
+        ])
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
