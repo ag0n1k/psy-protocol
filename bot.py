@@ -91,6 +91,14 @@ CONSENT_TEXT = """📋 <b>Пользовательское соглашение<
 
 
 @dataclass
+class QueueTicket:
+    """Место в очереди на пайплайн; живёт с постановки до захвата семафора."""
+
+    chat_id: int
+    enqueued_at: float
+
+
+@dataclass
 class JobSession:
     work_dir: Path
     audio_path: Path
@@ -101,6 +109,10 @@ class JobSession:
 job_sessions: Dict[int, "JobSession"] = {}
 processing_chats: set[int] = set()
 PIPELINE_SEMAPHORE = asyncio.Semaphore(1)
+
+# Сколько задач может ждать своей очереди, не считая той, что обрабатывается сейчас.
+MAX_QUEUE_LENGTH = 5
+pipeline_queue: "list[QueueTicket]" = []
 
 CONSENTS_FILE = Path("consents/accepted.txt")
 consented_users: set[int] = set()
@@ -456,6 +468,37 @@ def cleanup_work_dir(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def queue_is_full() -> bool:
+    return len(pipeline_queue) >= MAX_QUEUE_LENGTH
+
+
+def enqueue_ticket(chat_id: int) -> QueueTicket:
+    ticket = QueueTicket(chat_id=chat_id, enqueued_at=time.monotonic())
+    pipeline_queue.append(ticket)
+    logging.info(
+        "Queued chat_id=%s, waiting=%d, busy=%s",
+        chat_id, len(pipeline_queue), PIPELINE_SEMAPHORE.locked(),
+    )
+    return ticket
+
+
+def release_ticket(ticket: QueueTicket) -> None:
+    if ticket in pipeline_queue:
+        pipeline_queue.remove(ticket)
+        logging.info(
+            "Dequeued chat_id=%s after %.1fs, waiting=%d",
+            ticket.chat_id, time.monotonic() - ticket.enqueued_at, len(pipeline_queue),
+        )
+
+
+def queue_position(ticket: QueueTicket) -> int:
+    """1 — следующий на обработку; 0 — тикет уже покинул очередь."""
+    try:
+        return pipeline_queue.index(ticket) + 1
+    except ValueError:
+        return 0
+
+
 def build_bar(percent: float) -> str:
     clamped = max(0.0, min(100.0, percent))
     filled = int(clamped // 10)
@@ -476,6 +519,20 @@ def stage_label(stage: str) -> str:
     return labels.get(stage, stage.title())
 
 
+def render_queue_text(ticket: Optional[QueueTicket]) -> str:
+    """Текст ожидания: бот считает по одному файлу за раз."""
+    position = queue_position(ticket) if ticket else 0
+    if position <= 1:
+        place = "Ваш файл — следующий."
+    else:
+        place = f"Перед вами в очереди: {position - 1}."
+    return (
+        "⏳ Сейчас обрабатывается другой файл.\n"
+        f"{place}\n"
+        "Начну автоматически, как освободится — ждать в чате не нужно."
+    )
+
+
 def render_progress_text(progress: Dict[str, Any]) -> str:
     if progress.get("done"):
         if progress.get("success"):
@@ -483,6 +540,9 @@ def render_progress_text(progress: Dict[str, Any]) -> str:
         return "❌ Не удалось обработать аудио."
 
     stage = progress.get("stage", "start")
+    if stage == "queue":
+        return render_queue_text(progress.get("ticket"))
+
     percent = progress.get("percent")
     value = float(percent) if percent is not None else 0.0
     bar = build_bar(value)
@@ -528,11 +588,15 @@ async def run_pipeline_and_send(
     updater_task = asyncio.create_task(
         progress_updater(status_message, progress, interval_seconds=5)
     )
+    ticket = enqueue_ticket(chat_id)
     try:
         if PIPELINE_SEMAPHORE.locked():
+            progress["ticket"] = ticket
             _update_progress(progress, "queue", 0.0, "Waiting in processing queue", chat_id)
 
         async with PIPELINE_SEMAPHORE:
+            release_ticket(ticket)
+            _update_progress(progress, "start", 0.0, "Processing started", chat_id)
             docx_path, txt_path = await asyncio.to_thread(
                 process_audio_file, audio_path, opts, lambda s, p, m: _update_progress(progress, s, p, m, chat_id)
             )
@@ -565,6 +629,7 @@ async def run_pipeline_and_send(
             logging.debug("Updater task finished with error", exc_info=True)
         return False
     finally:
+        release_ticket(ticket)
         if not updater_task.done():
             updater_task.cancel()
 
@@ -680,6 +745,13 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
         )
         return
 
+    if queue_is_full():
+        await message.answer(
+            "Сейчас очередь заполнена: бот обрабатывает файлы по одному, "
+            f"и в ожидании уже {len(pipeline_queue)}. Попробуйте отправить запись чуть позже 🙏"
+        )
+        return
+
     active_session = job_sessions.get(chat_id)
     if active_session:
         if not active_session.audio_path.exists():
@@ -710,11 +782,18 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             return
 
         work_dir, audio_path, output_docx = download_result
-        status_message = await _run_with_retries(
-            lambda: message.answer(
+        if PIPELINE_SEMAPHORE.locked():
+            initial_status = (
+                "Спасибо! 😊 Аудио получено и поставлено в очередь: "
+                "бот обрабатывает файлы по одному ⏳"
+            )
+        else:
+            initial_status = (
                 "Спасибо! 😊 Аудио получено, начинаю обработку. "
                 "Пожалуйста, немного подождите ⏳"
-            ),
+            )
+        status_message = await _run_with_retries(
+            lambda: message.answer(initial_status),
             operation='send initial status',
         )
         options = build_processing_options(settings, output_docx=output_docx, cache_dir=work_dir / "cache")
@@ -763,6 +842,13 @@ async def handle_retry_callback(
     if chat_id in processing_chats:
         if callback.message:
             await callback.message.answer('Обработка уже выполняется. Дождитесь завершения.')
+        return
+
+    if queue_is_full():
+        if callback.message:
+            await callback.message.answer(
+                'Сейчас очередь заполнена, попробуйте повторить обработку чуть позже 🙏'
+            )
         return
 
     session = job_sessions.get(chat_id)
