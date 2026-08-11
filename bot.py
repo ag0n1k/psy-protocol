@@ -43,10 +43,9 @@ TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
 
 PHOTO_CAPTION_LIMIT = 1024
-# Сессия обычно 50-60 минут, полтора часа берёт и сдвоенные. Длительность приходит
-# только для voice/audio: у документа её нет, там ограничением работает размер.
-MAX_AUDIO_DURATION_SECONDS = 90 * 60
-MAX_AUDIO_BYTES = 200 * 1024 * 1024
+DEFAULT_MAX_AUDIO_MINUTES = 120
+DEFAULT_MAX_AUDIO_MB = 300
+DEFAULT_MAX_QUEUE_LENGTH = 5
 
 LOG_FILE = Path('logs/bot.log')
 LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -133,8 +132,6 @@ processing_chats: set[int] = set()
 active_work_dirs: set[Path] = set()
 PIPELINE_SEMAPHORE = asyncio.Semaphore(1)
 
-# Сколько задач может ждать своей очереди, не считая той, что обрабатывается сейчас.
-MAX_QUEUE_LENGTH = 5
 pipeline_queue: "list[QueueTicket]" = []
 
 # Соглашение обещает удаление аудио и результатов через час — этот срок и выдерживаем.
@@ -215,6 +212,19 @@ class TelegramSettings:
 
 
 @dataclass
+class Limits:
+    """Операционные пределы: зависят от машины, поэтому живут в окружении."""
+
+    max_audio_seconds: int = DEFAULT_MAX_AUDIO_MINUTES * 60
+    max_audio_bytes: int = DEFAULT_MAX_AUDIO_MB * 1024 * 1024
+    # Сколько задач может ждать очереди, не считая обрабатываемой сейчас.
+    max_queue_length: int = DEFAULT_MAX_QUEUE_LENGTH
+
+
+limits = Limits()
+
+
+@dataclass
 class DonateSettings:
     """Реквизиты для донатов, задаются только через окружение."""
 
@@ -270,6 +280,37 @@ def load_settings(env: Optional[Dict[str, str]] = None) -> TelegramSettings:
         diarization_model=env.get("PSY_DIARIZATION_MODEL"),
         max_speakers=int(max_speakers) if max_speakers else None,
     )
+
+
+def _env_int(env: Dict[str, str], key: str, default: int) -> int:
+    raw = env.get(key)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.warning('Invalid %s=%r, falling back to %d', key, raw, default)
+        return default
+    if value <= 0:
+        logging.warning('Non-positive %s=%d, falling back to %d', key, value, default)
+        return default
+    return value
+
+
+def load_limits(env: Optional[Dict[str, str]] = None) -> Limits:
+    env = env if env is not None else read_env()
+    loaded = Limits(
+        max_audio_seconds=_env_int(env, 'PSY_MAX_AUDIO_MINUTES', DEFAULT_MAX_AUDIO_MINUTES) * 60,
+        max_audio_bytes=_env_int(env, 'PSY_MAX_AUDIO_MB', DEFAULT_MAX_AUDIO_MB) * 1024 * 1024,
+        max_queue_length=_env_int(env, 'PSY_MAX_QUEUE_LENGTH', DEFAULT_MAX_QUEUE_LENGTH),
+    )
+    logging.info(
+        'Limits: audio <= %d min / %d MB, queue <= %d waiting',
+        loaded.max_audio_seconds // 60,
+        loaded.max_audio_bytes // (1024 * 1024),
+        loaded.max_queue_length,
+    )
+    return loaded
 
 
 def load_admin_chat_ids(env: Optional[Dict[str, str]] = None) -> set[int]:
@@ -492,16 +533,16 @@ def build_work_paths(message: Message, suffix: str) -> Tuple[Path, Path, Path, P
 def check_media_limits(media: Any) -> Optional[str]:
     """Причина отказа, если файл слишком велик или длинен; None — можно брать."""
     duration = getattr(media, 'duration', None)
-    if isinstance(duration, int) and duration > MAX_AUDIO_DURATION_SECONDS:
+    if isinstance(duration, int) and duration > limits.max_audio_seconds:
         return (
-            f'Запись длиннее {MAX_AUDIO_DURATION_SECONDS // 60} минут '
+            f'Запись длиннее {limits.max_audio_seconds // 60} минут '
             f'({duration // 60} мин) — такую бот не потянет. '
             'Разрежьте её на части и пришлите по очереди 🙏'
         )
     size = getattr(media, 'file_size', None)
-    if isinstance(size, int) and size > MAX_AUDIO_BYTES:
+    if isinstance(size, int) and size > limits.max_audio_bytes:
         return (
-            f'Файл больше {MAX_AUDIO_BYTES // (1024 * 1024)} МБ '
+            f'Файл больше {limits.max_audio_bytes // (1024 * 1024)} МБ '
             f'({size // (1024 * 1024)} МБ). Если это WAV с диктофона — '
             'пересохраните в mp3 или m4a, звук для распознавания не пострадает 🙏'
         )
@@ -622,7 +663,7 @@ async def cleanup_worker() -> None:
 
 
 def queue_is_full() -> bool:
-    return len(pipeline_queue) >= MAX_QUEUE_LENGTH
+    return len(pipeline_queue) >= limits.max_queue_length
 
 
 def enqueue_ticket(chat_id: int) -> QueueTicket:
@@ -1333,11 +1374,12 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
 
 
 async def run_bot() -> None:
-    global donate_settings, admin_chat_ids
+    global donate_settings, admin_chat_ids, limits
     env = read_env()
     settings = load_settings(env)
     donate_settings = load_donate_settings(env)
     admin_chat_ids = load_admin_chat_ids(env)
+    limits = load_limits(env)
     ensure_temp_root()
     purge_temp_root()
     load_consents()
