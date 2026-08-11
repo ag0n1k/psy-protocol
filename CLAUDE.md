@@ -523,7 +523,13 @@ psy_protocol/
   как обещано в соглашении) — и сессии, и осиротевшие каталоги; при старте `purge_temp_root()`
   чистит `transcripts/telegram_temp` целиком. Каталоги задач в работе защищены `active_work_dirs`
 - Любое сообщение без медиа (`/start` или произвольный текст) → приветствие или просьба принять соглашение
-- Настройки из `.env`: TELEGRAM_BOT_TOKEN, PSY_WHISPER_MODEL, PSY_DIARIZATION_MODEL, PSY_MAX_SPEAKERS
+- Учёт использования: каждое событие пишется строкой в `stats/events.jsonl`
+  (`psy_protocol/usage_stats.py`), chat_id хранится хешем. `/stats` показывает свод за
+  сегодня/7/30 дней/всё время и доступна только чатам из `PSY_ADMIN_CHAT_IDS`
+- Логи: `logs/bot.log` с таймстампами и ротацией (10 МБ × 5) — `logs/bot.stderr.log`
+  от launchd остаётся только для необработанных падений
+- Настройки из `.env`: TELEGRAM_BOT_TOKEN, PSY_WHISPER_MODEL, PSY_DIARIZATION_MODEL,
+  PSY_MAX_SPEAKERS, PSY_DONATE_URL, PSY_DONATE_TON_ADDRESS, PSY_ADMIN_CHAT_IDS
 
 ## CLI субкоманды
 

@@ -28,7 +28,7 @@ DEFAULT_LLM_API_BASE = 'http://localhost:1234/v1'
 DEFAULT_LLM_MODEL = 'qwen3.5-9b'
 DEFAULT_LLM_TASKS = ['role_validation', 'text_correction', 'analysis']
 
-LOG_FORMAT = "%(levelname)s %(message)s"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
 TABLE_HEADERS = [
     "№",

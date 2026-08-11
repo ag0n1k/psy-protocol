@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import logging
+import logging.handlers
 import os
 import shutil
 import time
@@ -27,10 +28,23 @@ from psy_protocol.cli import _parse_text_file
 from psy_protocol.config import LOG_FORMAT
 from psy_protocol.docx_writer import create_docx
 from psy_protocol.pipeline import ProcessingOptions, process_audio_file
+from psy_protocol.usage_stats import (
+    EVENT_CONSENT,
+    EVENT_PROCESSED,
+    EVENT_REJECTED,
+    EVENT_TEXT_DOCX,
+    format_report,
+    load_events,
+    record_event,
+)
 
 
 TEMP_ROOT = Path("transcripts/telegram_temp")
 SUPPORTED_AUDIO_MIME_PREFIX = "audio/"
+
+LOG_FILE = Path('logs/bot.log')
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 DONATE_BANNER = Path('assets/donate_banner.png')
 DONATE_LINK_BUTTON_TEXT = '☕️ Купить кофе'
@@ -123,6 +137,8 @@ CLEANUP_INTERVAL_SECONDS = 300
 
 CONSENTS_FILE = Path("consents/accepted.txt")
 consented_users: set[int] = set()
+# Кому доступна /stats; заполняется в run_bot() из PSY_ADMIN_CHAT_IDS.
+admin_chat_ids: set[int] = set()
 T = TypeVar('T')
 
 
@@ -232,6 +248,23 @@ def load_settings() -> TelegramSettings:
         diarization_model=env.get("PSY_DIARIZATION_MODEL"),
         max_speakers=int(max_speakers) if max_speakers else None,
     )
+
+
+def load_admin_chat_ids() -> set[int]:
+    env = {**parse_env_file(Path(".env")), **os.environ}
+    raw = env.get("PSY_ADMIN_CHAT_IDS", "")
+    ids = set()
+    for chunk in raw.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            ids.add(int(chunk))
+        except ValueError:
+            logging.warning("Ignoring non-numeric admin chat id: %r", chunk)
+    if not ids:
+        logging.info("No admins configured, /stats is disabled (set PSY_ADMIN_CHAT_IDS)")
+    return ids
 
 
 def load_donate_settings() -> DonateSettings:
@@ -659,12 +692,14 @@ async def run_pipeline_and_send(
     status_message: Message,
     reply_target: Message,
     progress: Dict[str, Any],
+    source: str = 'audio',
 ) -> bool:
     """Run the pipeline and send result files. Returns True on success."""
     updater_task = asyncio.create_task(
         progress_updater(status_message, progress, interval_seconds=5)
     )
     ticket = enqueue_ticket(chat_id)
+    started_at = time.monotonic()
     try:
         if PIPELINE_SEMAPHORE.locked():
             progress["ticket"] = ticket
@@ -694,10 +729,18 @@ async def run_pipeline_and_send(
             ),
             operation='send retry keyboard',
         )
+        record_event(
+            EVENT_PROCESSED, chat_id, ok=True, source=source,
+            duration_sec=round(time.monotonic() - started_at, 1),
+        )
         return True
     except Exception:
         progress["done"] = True
         progress["success"] = False
+        record_event(
+            EVENT_PROCESSED, chat_id, ok=False, source=source,
+            duration_sec=round(time.monotonic() - started_at, 1),
+        )
         logging.exception("Pipeline failed for chat_id=%s", chat_id)
         try:
             await updater_task
@@ -802,6 +845,7 @@ async def process_text_file_and_reply(message: Message, bot: Bot) -> None:
         lambda: message.answer_document(FSInputFile(path=str(output_docx))),
         operation='send text-to-docx result',
     )
+    record_event(EVENT_TEXT_DOCX, chat_id, replicas=len(replicas))
     cleanup_work_dir(work_dir)
 
 
@@ -822,6 +866,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
         return
 
     if queue_is_full():
+        record_event(EVENT_REJECTED, chat_id, reason='queue_full')
         await message.answer(
             "Сейчас очередь заполнена: бот обрабатывает файлы по одному, "
             f"и в ожидании уже {len(pipeline_queue)}. Попробуйте отправить запись чуть позже 🙏"
@@ -884,6 +929,7 @@ async def process_and_reply(message: Message, bot: Bot, settings: TelegramSettin
             status_message=status_message,
             reply_target=message,
             progress=progress,
+            source='voice' if message.voice else 'audio',
         )
 
         if success:
@@ -982,6 +1028,7 @@ async def handle_retry_callback(
             status_message=status_message,
             reply_target=callback.message,
             progress=progress,
+            source=f'retry:{preset_key}',
         )
     finally:
         processing_chats.discard(chat_id)
@@ -1037,6 +1084,7 @@ async def handle_consent_callback(callback: CallbackQuery) -> None:
     if chat_id not in consented_users:
         consented_users.add(chat_id)
         save_consent(chat_id)
+        record_event(EVENT_CONSENT, chat_id)
         logging.info("Consent accepted for chat_id=%s", chat_id)
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -1067,6 +1115,16 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
     @dp.message(Command('donate'))
     async def handle_donate(message: Message) -> None:
         await send_donate_message(message)
+
+    @dp.message(Command('stats'))
+    async def handle_stats(message: Message) -> None:
+        chat_id = message.chat.id if message.chat else 0
+        if chat_id not in admin_chat_ids:
+            # Для остальных команда как будто не существует — обычное приветствие.
+            await handle_start(message)
+            return
+        events = await asyncio.to_thread(load_events)
+        await message.answer(format_report(events), parse_mode='HTML')
 
     @dp.callback_query(F.data == "consent:accept")
     async def handle_consent(callback: CallbackQuery) -> None:
@@ -1106,9 +1164,10 @@ def create_dispatcher(settings: TelegramSettings) -> Dispatcher:
 
 
 async def run_bot() -> None:
-    global donate_settings
+    global donate_settings, admin_chat_ids
     settings = load_settings()
     donate_settings = load_donate_settings()
+    admin_chat_ids = load_admin_chat_ids()
     ensure_temp_root()
     purge_temp_root()
     load_consents()
@@ -1132,8 +1191,21 @@ async def run_bot() -> None:
         await bot.session.close()
 
 
+def configure_logging() -> None:
+    """Логи бота — в ротируемый файл; launchd-овский stderr остаётся для падений."""
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding='utf-8',
+    )
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    configure_logging()
     asyncio.run(run_bot())
 
 

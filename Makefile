@@ -31,7 +31,7 @@ service-status:
 	launchctl list | grep $(LABEL) || echo "not loaded"
 
 service-logs:
-	tail -f logs/bot.stdout.log logs/bot.stderr.log
+	tail -f logs/bot.log
 
 watchdog-install:
 	bash infra/macos/install_watchdog.sh

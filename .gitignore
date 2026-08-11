@@ -17,6 +17,7 @@ victoria-metrics-data/
 grafana-data/
 transcripts/
 consents/
+stats/
 tests/
 
 # Infra build artifacts
