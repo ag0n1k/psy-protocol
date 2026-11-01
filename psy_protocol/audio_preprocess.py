@@ -2,6 +2,9 @@ import logging
 import os
 import shutil
 import subprocess
+from typing import Tuple
+
+import numpy as np
 
 
 def _ffmpeg_bin() -> str:
@@ -40,6 +43,26 @@ def preprocess_audio(input_path: str, output_path: str) -> None:
     if result.returncode != 0:
         raise RuntimeError(f'ffmpeg preprocessing failed: {result.stderr[-500:]}')
     logging.info('Audio preprocessed: %s -> %s', input_path, output_path)
+
+
+def load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
+    """
+    Decode audio into a mono float32 waveform of shape (1, samples) via ffmpeg CLI.
+
+    Not torchaudio.load: it goes through torchcodec, which links against a fixed range
+    of FFmpeg library versions and breaks on every major `brew upgrade ffmpeg`.
+    """
+    cmd = [
+        _ffmpeg_bin(), '-v', 'error', '-i', path,
+        '-f', 's16le', '-ac', '1', '-ar', str(target_sr),
+        '-',
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors='replace')
+        raise RuntimeError(f'ffmpeg decoding failed: {stderr[-500:]}')
+    samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    return samples[np.newaxis, :], target_sr
 
 
 def extract_audio_segment(input_path: str, start: float, end: float, output_path: str) -> None:

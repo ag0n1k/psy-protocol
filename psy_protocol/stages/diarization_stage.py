@@ -2,11 +2,11 @@ import logging
 from pathlib import Path
 from typing import Callable, List
 
+from ..audio_preprocess import load_audio
 from ..diarization import (
     SpeakerSegment,
     cluster_segments_by_embeddings,
     diarize_audio_mlx,
-    load_audio,
     post_process_diarization,
 )
 from ..io_utils import load_json, save_json

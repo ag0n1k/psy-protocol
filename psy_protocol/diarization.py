@@ -14,6 +14,7 @@ if not hasattr(torchaudio, 'list_audio_backends'):
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import RemoteEntryNotFoundError
 
+from .audio_preprocess import load_audio
 from .config import (
     DEFAULT_EMBEDDING_MIN_DURATION,
     DEFAULT_EMBEDDING_N_MELS,
@@ -388,16 +389,6 @@ def resolve_diarization_weights_safetensors(model_ref: str) -> Path:
 
     weights_path = hf_hub_download(repo_id=model_ref, filename="model.safetensors")
     return Path(weights_path)
-
-
-def load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
-    waveform, sr = torchaudio.load(path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != target_sr:
-        resampler = torchaudio.transforms.Resample(sr, target_sr)
-        waveform = resampler(waveform)
-    return waveform.numpy(), target_sr
 
 
 def process_audio_chunks(
